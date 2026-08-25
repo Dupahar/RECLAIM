@@ -1,0 +1,33 @@
+{
+  "settlements": [
+    {
+      "id": "s1", "gross_amount": "5000.00", "currency": "INR",
+      "ts": "2026-08-25T09:00:00",
+      "fees": {"mdr": "100.00", "gst_on_mdr": "18.00", "tcs": "0", "other": "0"},
+      "refs": {"utr": "UTR-1", "order_id": "ORD-1"}
+    },
+    {
+      "id": "s2", "gross_amount": "3000.00", "currency": "INR",
+      "ts": "2026-08-25T09:00:00",
+      "refs": {"utr": "UTR-2"}
+    },
+    {
+      "id": "s3", "gross_amount": "1500.00", "currency": "INR",
+      "ts": "2026-08-25T09:00:00",
+      "refs": {"utr": "UTR-3", "order_id": "ORD-3"}
+    },
+    {
+      "id": "s4", "gross_amount": "750.00", "currency": "INR",
+      "ts": "2026-08-25T09:00:00",
+      "refs": {"utr": "UTR-4"}
+    }
+  ],
+  "bank_credits": [
+    {"id": "b1", "gross_amount": "4882.00", "currency": "INR",
+     "ts": "2026-08-25T09:00:00", "refs": {"utr": "UTR-1"}},
+    {"id": "b2", "gross_amount": "2800.00", "currency": "INR",
+     "ts": "2026-08-25T09:00:00", "refs": {"utr": "UTR-2"}},
+    {"id": "b3", "gross_amount": "1500.00", "currency": "INR",
+     "ts": "2026-08-25T09:00:00", "refs": {"utr": "UTR-3X", "order_id": "ORD-3"}}
+  ]
+}

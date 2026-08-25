@@ -1,0 +1,8 @@
+record_type,id,gross_amount,currency,ts,mdr,gst_on_mdr,tcs,other,utr,rrn,order_id,invoice_no
+settlement,s1,5000.00,INR,2026-08-25T09:00:00,100.00,18.00,0,0,UTR-1,,ORD-1,
+settlement,s2,3000.00,INR,2026-08-25T09:00:00,,,,,UTR-2,,,
+settlement,s3,1500.00,INR,2026-08-25T09:00:00,,,,,UTR-3,,ORD-3,
+settlement,s4,750.00,INR,2026-08-25T09:00:00,,,,,UTR-4,,,
+bank,b1,4882.00,INR,2026-08-25T09:00:00,,,,,UTR-1,,,
+bank,b2,2800.00,INR,2026-08-25T09:00:00,,,,,UTR-2,,,
+bank,b3,1500.00,INR,2026-08-25T09:00:00,,,,,UTR-3X,,ORD-3,
