@@ -127,9 +127,8 @@ def test_cli_replay_verifies_stored_run(tmp_path, capsys):
     store = tmp_path / "run"
     # first, persist a run
     assert main([str(SAMPLE), "--store", str(store)]) == 0
-    # capture the audit root that was printed
-    persisted_out = capsys.readouterr().out
-    root = persisted_out.split("audit root ")[1].split("...")[0]
+    capsys.readouterr()
+    root = (store / "root.txt").read_text(encoding="utf-8").strip()
 
     # replay-verify it
     rc = main(["--replay", str(store)])
@@ -286,8 +285,10 @@ def test_store_publishes_root_file(tmp_path, capsys):
     out = capsys.readouterr().out
     published = (store / "root.txt").read_text(encoding="utf-8").strip()
     assert len(published) == 64                      # full sha256 hex
-    assert published.startswith(out.split("audit root ")[1].split("...")[0])
+    assert published[:16] in out                     # the printed prefix agrees
     assert "published:" in out
+    # the head history records (size, root) so a later replay can prove append-only
+    assert (store / "roots.log").read_text(encoding="utf-8").strip() == f"4 {published}"
 
 
 def test_replay_auto_anchors_on_root_file(tmp_path, capsys):
@@ -382,3 +383,102 @@ def test_cli_reports_closure_rate(capsys):
     # CLI is detection-only: nothing recovered, so closure == match.
     assert data["closed"] == data["matched"]
     assert data["closure_rate"] == data["match_rate"]
+
+
+# --------------------------------------------------------------------------
+# Append-only enforcement across runs (Phase 20). root.txt catches a log edited
+# since publication; only the *head history* catches a log rewritten and then
+# re-published.
+# --------------------------------------------------------------------------
+def _second_batch(tmp_path):
+    """The sample batch with fresh ids, so it appends rather than dedupes."""
+    data = json.loads(SAMPLE.read_text(encoding="utf-8"))
+    for s in data["settlements"]:
+        s["id"] += "_r2"
+        s["refs"]["utr"] = s["refs"].get("utr", "") + "_r2"
+    for c in data["bank_credits"]:
+        c["id"] += "_r2"
+        c["refs"]["utr"] = c["refs"].get("utr", "") + "_r2"
+    p = tmp_path / "batch2.json"
+    p.write_text(json.dumps(data), encoding="utf-8")
+    return p
+
+
+def test_head_published_describes_the_store_not_the_run(tmp_path, capsys):
+    """A store accumulates; the head must track the store, not one batch."""
+    store = tmp_path / "run"
+    main([str(SAMPLE), "--store", str(store)])
+    main([str(_second_batch(tmp_path)), "--store", str(store), "--at", "2026-08-26T09:00:00"])
+    capsys.readouterr()
+    heads = [l.split() for l in (store / "roots.log").read_text(encoding="utf-8").splitlines()]
+    assert [int(h[0]) for h in heads] == [4, 8]          # store size, not 4 and 4
+    assert (store / "root.txt").read_text(encoding="utf-8").strip() == heads[-1][1]
+
+
+def test_replay_confirms_append_only_growth(tmp_path, capsys):
+    store = tmp_path / "run"
+    main([str(SAMPLE), "--store", str(store)])
+    main([str(_second_batch(tmp_path)), "--store", str(store), "--at", "2026-08-26T09:00:00"])
+    capsys.readouterr()
+    rc = main(["--replay", str(store)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "append-only      : ok (vs 2 published head/s)" in out
+
+
+def test_replay_catches_a_rewrite_hidden_behind_a_refreshed_root(tmp_path, capsys):
+    """The attack root.txt alone cannot stop: rewrite history, republish the root."""
+    store = tmp_path / "run"
+    main([str(SAMPLE), "--store", str(store)])
+    main([str(_second_batch(tmp_path)), "--store", str(store), "--at", "2026-08-26T09:00:00"])
+    capsys.readouterr()
+
+    audit_path = store / "audit.jsonl"
+    lines = audit_path.read_text(encoding="utf-8").splitlines()
+    rec = json.loads(lines[0])
+    rec["detail"]["amount"] = "9999.00 INR"
+    lines[0] = json.dumps(rec, separators=(",", ":"), sort_keys=True)
+    audit_path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+
+    from reclaim.persistence import AuditRepository, JsonlFileStore
+    forged = AuditRepository(JsonlFileStore(audit_path)).load().root()
+    (store / "root.txt").write_text(forged + "\n", encoding="utf-8", newline="\n")
+
+    rc = main(["--replay", str(store)])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "root matches     : True" in out           # the forged anchor agrees...
+    assert "inclusion proofs : ok" in out             # ...and the log self-verifies...
+    assert "append-only      : FAILED" in out         # ...but history does not extend
+
+
+def test_replay_ignores_malformed_head_lines(tmp_path, capsys):
+    store = tmp_path / "run"
+    main([str(SAMPLE), "--store", str(store)])
+    capsys.readouterr()
+    heads = store / "roots.log"
+    heads.write_text("garbage\nnotanumber deadbeef\n" + heads.read_text(encoding="utf-8"),
+                     encoding="utf-8", newline="\n")
+    assert main(["--replay", str(store)]) == 0
+
+
+def test_head_history_is_idempotent_on_repersist(tmp_path, capsys):
+    store = tmp_path / "run"
+    main([str(SAMPLE), "--store", str(store)])
+    main([str(SAMPLE), "--store", str(store)])        # same run again
+    capsys.readouterr()
+    assert len((store / "roots.log").read_text(encoding="utf-8").strip().splitlines()) == 1
+
+
+def test_replay_without_a_head_history_reports_no_append_only_check(tmp_path, capsys):
+    """No published heads -> no consistency claim is made, rather than a false one."""
+    store = tmp_path / "run"
+    key = tmp_path / "k.bin"
+    key.write_bytes(b"0" * 32)
+    main([str(SAMPLE), "--store", str(store), "--key-file", str(key)])
+    capsys.readouterr()
+    (store / "roots.log").unlink()
+    rc = main(["--replay", str(store), "--key-file", str(key)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "append-only" not in out          # silent, not a bogus "ok"

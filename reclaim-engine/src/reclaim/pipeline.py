@@ -15,14 +15,16 @@ timestamps are supplied, so a run is fully reproducible (goal **G4**).
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal
 from typing import Callable, Optional
 
 from .audit import AuditEvent, MerkleAuditLog
 from .domain import Direction, LeakRecord, LeakType, LedgerEntry, RecoveryState, Transaction
-from .persistence import AuditRepository, EventStore, LedgerRepository
+from .persistence import AuditRepository, EventStore, LeakRepository, LedgerRepository
+from .leak_ledger import LeakLedger
+from .measurement import Arm, HoldoutPolicy, Observation
 from .ledger import Ledger, Posting
 from .money import Money
 from .probabilistic import DEFAULT_CONFIG as PROB_DEFAULT, MatchConfig, ScoredMatch, probabilistic_match
@@ -74,6 +76,7 @@ class RunReport:
     recoveries: tuple[RecoveryOutcome, ...]
     exact: ReconciliationResult
     ledger: Ledger
+    control_leaks: tuple[LeakRecord, ...] = ()   # held out to measure lift (G9)
 
     def leaked_residual(self) -> Money:
         total = Money.zero(self.currency)
@@ -164,8 +167,47 @@ def build_audit_log(report: "RunReport", at: datetime) -> MerkleAuditLog:
     return log
 
 
+def build_leak_ledger(report: "RunReport", audit=None) -> LeakLedger:
+    """Turn a run into the durable Leak Ledger (architecture Layer 2, §5.2).
+
+    Records every leak reconciliation detected, then appends the *outcome* as a
+    second version — recovery writing back over the seam without ever editing
+    what reconciliation wrote. Three outcomes are possible:
+
+    - a recovery ran     -> its final state (RECOVERED / EXHAUSTED / HALTED / ...)
+    - a later match won  -> SUPERSEDED; the "leak" was a matching failure, not
+                            missing money, so it must not sit in a human queue
+    - neither            -> stays as detected, i.e. genuinely still open
+
+    When an ``audit`` log is supplied, each leak is stamped with an ``audit_ref``
+    of ``"<root>:<leaf index>"`` — precisely the pair needed to pull an
+    inclusion proof, so a leak can prove its own place in the log.
+    """
+    ledger = LeakLedger()
+    residual_ids = {leak.id for leak in report.residual_leaks}
+    outcome_by_leak = {r.leak.id: r.final_state for r in report.recoveries}
+
+    audit_index: dict[str, str] = {}
+    if audit is not None:
+        root = audit.root()
+        for i, event in enumerate(audit.events()):
+            leak_id = event.detail.get("leak")
+            if leak_id:      # last event wins: a recovery outcome outranks detection
+                audit_index[leak_id] = f"{root}:{i}"
+
+    for leak in report.exact.leaks:
+        ref = audit_index.get(leak.id)
+        ledger.record(replace(leak, audit_ref=ref) if ref else leak)
+        if leak.id in outcome_by_leak:
+            ledger.transition(leak.id, outcome_by_leak[leak.id])
+        elif leak.id not in residual_ids:
+            ledger.transition(leak.id, RecoveryState.SUPERSEDED)
+    return ledger
+
+
 def persist_run(report: "RunReport", at: datetime,
-                ledger_store: EventStore, audit_store: EventStore) -> MerkleAuditLog:
+                ledger_store: EventStore, audit_store: EventStore,
+                leak_store: EventStore | None = None) -> MerkleAuditLog:
     """Persist a run: append the ledger postings and the audit events to the
     given (append-only) stores. Returns the audit log so callers can report its
     root. Reloading the stores reproduces identical balances and Merkle root."""
@@ -176,6 +218,10 @@ def persist_run(report: "RunReport", at: datetime,
     audit_repo = AuditRepository(audit_store)
     for event in audit.events():
         audit_repo.append_event(event)
+    if leak_store is not None:
+        # The Leak Ledger is stamped with audit refs, so it must be built after
+        # the audit log exists.
+        LeakRepository(leak_store).save_ledger(build_leak_ledger(report, audit))
     return audit
 
 
@@ -188,6 +234,7 @@ def run_reclaim(
     reason_for: Optional[Callable[[LeakRecord], FailureReason]] = None,
     base_time: Optional[datetime] = None,
     prob_config: MatchConfig = PROB_DEFAULT,
+    holdout: Optional[HoldoutPolicy] = None,
 ) -> RunReport:
     """Run the full detect -> recover -> book loop over a batch."""
     if recovery_engine is not None and base_time is None:
@@ -232,9 +279,15 @@ def run_reclaim(
     # 5) Bounded recovery on recoverable leaks (optional).
     recoveries: list[RecoveryOutcome] = []
     recovered_leak_ids: set[str] = set()
+    control_leaks: list[LeakRecord] = []
     if recovery_engine is not None:
         for leak in exact.leaks:
             if leak.recoverable:
+                if holdout is not None and holdout.arm(leak.id) is Arm.CONTROL:
+                    # Deliberately not chased. This costs real money and is the
+                    # only way to say later how much the chasing was worth (G9).
+                    control_leaks.append(leak)
+                    continue
                 out = recovery_engine.recover(leak, reason_for(leak), base_time)
                 recoveries.append(out)
                 if out.final_state is RecoveryState.RECOVERED:
@@ -278,4 +331,5 @@ def run_reclaim(
         recoveries=tuple(recoveries),
         exact=exact,
         ledger=ledger,
+        control_leaks=tuple(control_leaks),
     )

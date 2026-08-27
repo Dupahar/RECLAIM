@@ -65,6 +65,14 @@ class RecoveryState(str, Enum):
     EXHAUSTED = "exhausted"
     NOT_RECOVERABLE = "not_recoverable"
     HALTED = "halted"  # stopped mid-recovery; needs a human (e.g. executor error / unknown cause)
+    SUPERSEDED = "superseded"  # a later fuzzy/AI match resolved it -- never a real leak
+
+
+def _validate_evidence(evidence) -> None:
+    """Evidence is an immutable tuple of human-readable facts (Appendix B)."""
+    _require(isinstance(evidence, tuple), "evidence must be a tuple")
+    _require(all(isinstance(e, str) and e != "" for e in evidence),
+             "every evidence item must be a non-empty string")
 
 
 def _validate_confidence(value: Optional[float], label: str) -> None:
@@ -132,6 +140,7 @@ class Transaction:
     narration_raw: Optional[str] = None
     match_status: MatchStatus = MatchStatus.UNMATCHED
     match_confidence: Optional[float] = None
+    evidence: tuple[str, ...] = ()      # Appendix B: why this record reads as it does
 
     def __post_init__(self) -> None:
         _require(isinstance(self.id, str) and self.id != "", "transaction id is required")
@@ -147,6 +156,7 @@ class Transaction:
                 "fees currency must match gross_amount currency",
             )
         _validate_confidence(self.match_confidence, "match_confidence")
+        _validate_evidence(self.evidence)
 
     @property
     def currency(self) -> str:
@@ -196,6 +206,8 @@ class LeakRecord:
     confidence: Optional[float] = None
     recoverable: bool = False
     recovery_state: RecoveryState = RecoveryState.NONE
+    evidence: tuple[str, ...] = ()      # Appendix B: the facts behind the hypothesis
+    audit_ref: Optional[str] = None     # Appendix B: link into the Merkle audit log
 
     def __post_init__(self) -> None:
         _require(isinstance(self.id, str) and self.id != "", "leak id is required")
@@ -207,3 +219,6 @@ class LeakRecord:
         _require(isinstance(self.recoverable, bool), "recoverable must be bool")
         _require(isinstance(self.recovery_state, RecoveryState), "recovery_state must be a RecoveryState")
         _validate_confidence(self.confidence, "confidence")
+        _validate_evidence(self.evidence)
+        _require(self.audit_ref is None or (isinstance(self.audit_ref, str) and self.audit_ref != ""),
+                 "audit_ref must be a non-empty string when set")

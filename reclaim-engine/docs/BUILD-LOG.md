@@ -450,3 +450,93 @@ refuses; a re-run can never masquerade as tampering. 19 modules, 338 tests, ADRs
   `src` on the path silently loads the other copy. The RUNBOOK now includes a one-line check.
 
 ---
+
+## 2026-08-28 — Sprint 2: six phases toward the full architecture (18–23)
+
+**What:** Closed the largest gaps between the engine and
+`RECLAIM-System-Architecture.md`, taking implemented components from roughly a
+third to roughly a half, and satisfying goal **G9** for the first time. Each
+phase extended a module that already existed — nothing structural was rewritten.
+
+- **Phase 18 · Blocking** (§6 stage 1) — candidate generation derived from the
+  scoring config rather than guessed, so it is *provably* lossless: a pair whose
+  amount score is below `(T - w_d - w_r) / w_a` cannot clear the review
+  threshold whatever else agrees. 2000×2000 drops from 4,000,000 scorings to
+  63,688 (1.6%) in 0.27s. Disables itself when no sound block exists. ADR-0017.
+- **Phase 19 · Leak Ledger** (§5.2) — the seam between reconciliation and
+  recovery, which was a type with no store. Append-only and *versioned*: state
+  changes append a version, never edit, so `history()` answers "why is this leak
+  in this state?". New `RecoveryState.SUPERSEDED` for leaks a later fuzzy/AI
+  match resolved — they were never missing money and must not sit in a queue.
+  `evidence[]` and a real `audit_ref` (`"<root>:<leaf index>"`, resolvable to an
+  inclusion proof) complete Appendix B. ADR-0018.
+- **Phase 20 · Consistency proofs** (§9.1) — RFC 6962's other half. `--store`
+  appends each published head to `roots.log`; `--replay` proves the log is an
+  append-only extension of every head ever published. This catches the attack
+  ADR-0015 could not: rewrite history *and* refresh `root.txt`, and inclusion
+  still passes while append-only fails. ADR-0019.
+- **Phase 21 · Executed notice + AFA ceiling** (§7, §10) — the RBI 24-hour
+  notice becomes an action behind a `NoticeExecutor` seam; a rejected or failed
+  notice halts with zero attempts (no debit without notice). `afa_limit`
+  (₹15,000) halts autonomous debits that would need customer authentication.
+  ADR-0020.
+- **Phase 22 · Causal measurement** (§9.2, **G9**) — deterministic hash-based
+  holdout, and lift measured as treated minus control. Reports `None` rather
+  than a flattering 100% when there is no control cohort; flags underpowered
+  cohorts; reports negative lift as negative. Worked example: gross ₹6,000,
+  causal ₹3,500. ADR-0021.
+- **Phase 23 · Scorecard** (§9.3) — the five-part ungameable scorecard: match
+  and closure rates, gross *and* causal recovery, residual, conduct
+  (`contacts_per_unit`, `wasted_contact_rate`, `notice_compliance`,
+  `halted_for_human`) and `time_to_closure_hours`. ADR-0021.
+
+**Why:** The prior gap analysis ranked blocking, a persisted Leak Ledger and
+causal measurement as the three most load-bearing absences — the first is a hard
+ceiling on batch size, the second is the contract two halves of the system are
+supposed to meet across, and the third is a stated goal with nothing behind it.
+Consistency proofs and the notice executor closed claims the code was making
+without honouring.
+
+**How tested:** 34 new tests; full suite **420 passed, 100% line + branch**
+(2025 statements, 554 branches, 0 partial) across 22 modules. Highlights, chosen
+because they test the property rather than the code path:
+`test_blocking_is_lossless_against_brute_force` runs a seeded corpus of
+tolerance-edge near-misses through the blocked matcher and an independent
+brute-force oracle and demands identical results; `test_consistency_proof_over_
+every_prefix_pair` verifies all 561 `(m, n)` pairs up to 33 entries, and
+truncating a proof at *any* position is rejected;
+`test_inclusion_alone_cannot_catch_that_rewrite` asserts the gap consistency
+proofs exist to fill; `test_open_queue_equals_the_reports_honest_residual` pins
+two representations of "what a human owns" that could otherwise drift;
+`test_a_worthless_intervention_measures_as_worthless` and
+`test_no_control_group_reports_none_not_a_perfect_score` are the measurement
+module's own honesty checks.
+
+**Bugs this work surfaced and fixed:** `root.txt` and the HMAC signature were
+written from the *run's* audit log rather than the *store's* — identical for a
+fresh directory, wrong the moment a second batch is persisted into the same one.
+Found by the first multi-run consistency test, not by review.
+
+**Result:** ✅ 22 modules, 420 tests, 100% line + branch, ADRs 0001–0021.
+Architecture coverage by layer: Data Platform ~10% (unchanged), Ledger Core
+~85%, Reconciliation ~80%, Leak Classifier ~90%, Recovery ~50%, Agentic Control
+~15%, Integrity & Measurement ~85%, cross-cutting ~35%. Goals: **G1–G9 met**
+(G9 newly), G10 outstanding.
+
+**Open items:**
+- **G10 scale** — blocking removes the matching ceiling, but the engine is still
+  single-process and batch-only. No Kafka, no CDC, no medallion layers.
+- **Layer 6 agentic control** remains the thinnest: escalation is an outcome,
+  not a runtime state. Nothing can pause, persist and wait for a human.
+- **Recovery ML** — uplift model, funded-moment predictor and contextual bandit
+  are still absent; the bandit is also the prerequisite for the IPS/DR offline
+  evaluation and drift monitors in §9.2.
+- **Control outcomes are not yet observed.** The holdout assigns cohorts and the
+  measurement is correct, but crediting real lift needs the T+1 re-reconciliation
+  loop to observe whether held-out leaks self-resolved. Deliberately not faked.
+- Cross-run contact caps and consent state are now *possible* (the Leak Ledger
+  persists) but not implemented.
+- `domain._validate_confidence` still rejects `Decimal` while
+  `resolver.Assessment` rejects `float` — carried over, still unresolved.
+
+---

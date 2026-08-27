@@ -5,9 +5,14 @@ Loads a persisted ledger + audit log and re-verifies, from scratch, that:
 - every audit event has a valid inclusion proof under the recomputed root, and
 - (optionally) the audit root matches a previously-published root.
 
-The last check is the real tamper-detection story: publish the audit root once,
-then at any later time replay the stored files and confirm the root is
-unchanged. Any edit/deletion of a stored decision changes the root and fails.
+- (optionally) the log is *consistent* with every root published earlier.
+
+The last two checks are the real tamper-detection story. Comparing against a
+published root catches a log that was altered since it was published. Comparing
+against the *history* of published roots catches more: a consistency proof shows
+the current log is an append-only extension of each earlier one, so an entry
+rewritten or removed between publications cannot hide behind a freshly
+recomputed, internally valid root.
 
 Loading itself is an integrity gate: a tampered ledger record that no longer
 balances, or a conflicting duplicate posting id, raises during rehydration and
@@ -31,10 +36,13 @@ class VerificationResult:
     proofs_ok: bool
     root_matches_expected: Optional[bool]  # None if no expected root supplied
     ok: bool
+    heads_checked: int = 0                 # prior published heads verified against
+    consistency_ok: Optional[bool] = None  # None if no prior heads were supplied
 
 
 def verify_stores(ledger_store: EventStore, audit_store: EventStore,
-                  expect_root: Optional[str] = None) -> VerificationResult:
+                  expect_root: Optional[str] = None,
+                  prior_heads: Optional[list] = None) -> VerificationResult:
     """Rehydrate and verify a stored run. Raises on unrehydratable data
     (corruption / broken invariants) — the caller treats that as a failure."""
     ledger = LedgerRepository(ledger_store).load()
@@ -50,7 +58,27 @@ def verify_stores(ledger_store: EventStore, audit_store: EventStore,
     )  # vacuously True for an empty log
 
     root_matches = None if expect_root is None else (root == expect_root)
-    ok = ledger_balanced and proofs_ok and (root_matches is not False)
+
+    # Consistency against every previously published head. An inclusion proof
+    # cannot show that history was not rewritten between publications -- only a
+    # consistency proof can, so a log that has ever been published is checked
+    # against each of those older roots as well.
+    consistency_ok: Optional[bool] = None
+    heads_checked = 0
+    if prior_heads:
+        consistency_ok = True
+        for size, published_root in prior_heads:
+            if size > audit.size:
+                consistency_ok = False       # the log shrank -- entries were removed
+                heads_checked += 1
+                continue
+            proof = audit.consistency_proof(size)
+            if not audit.verify_consistency(size, published_root, proof, root):
+                consistency_ok = False
+            heads_checked += 1
+
+    ok = (ledger_balanced and proofs_ok and (root_matches is not False)
+          and (consistency_ok is not False))
 
     return VerificationResult(
         ledger_balanced=ledger_balanced,
@@ -61,4 +89,6 @@ def verify_stores(ledger_store: EventStore, audit_store: EventStore,
         proofs_ok=proofs_ok,
         root_matches_expected=root_matches,
         ok=ok,
+        heads_checked=heads_checked,
+        consistency_ok=consistency_ok,
     )

@@ -76,6 +76,11 @@ class RecoveryConfig:
     notice_hours: int = 24       # RBI mandatory pre-debit notice window
     gap_hours: int = 24          # spacing between successive attempts
     channels: tuple[Channel, ...] = (Channel.UPI_RETRY,)
+    # RBI e-mandate: a recurring debit above this needs Additional Factor
+    # Authentication, which is a customer action the engine cannot perform.
+    # Above the ceiling the only correct autonomous behaviour is to stop and
+    # hand over (G8). Set to None to disable the check.
+    afa_limit: Optional[Money] = field(default_factory=lambda: Money.of("15000", "INR"))
 
     def __post_init__(self) -> None:
         for name, val in (("max_attempts", self.max_attempts),
@@ -88,9 +93,30 @@ class RecoveryConfig:
         if not (isinstance(self.channels, tuple) and len(self.channels) >= 1
                 and all(isinstance(c, Channel) for c in self.channels)):
             raise RecoveryError("channels must be a non-empty tuple of Channel")
+        if self.afa_limit is not None:
+            if not isinstance(self.afa_limit, Money):
+                raise RecoveryError("afa_limit must be Money or None")
+            if not self.afa_limit.is_positive:
+                raise RecoveryError("afa_limit must be positive")
 
 
 DEFAULT_CONFIG = RecoveryConfig()
+
+
+@runtime_checkable
+class NoticeExecutor(Protocol):
+    """The seam that actually *sends* the RBI pre-debit notice.
+
+    Recording a notice timestamp is not the same as giving notice. Until this
+    existed the engine scheduled attempts after a 24-hour window it had merely
+    written down; now the window is anchored to a notice that was really
+    dispatched, and a notice that cannot be sent halts the recovery instead of
+    silently debiting anyway.
+    """
+
+    def send(self, leak: LeakRecord, at_time: datetime,
+             idempotency_key: str) -> bool:  # pragma: no cover - protocol
+        ...
 
 
 @runtime_checkable
@@ -119,14 +145,17 @@ class RecoveryOutcome:
     recovered_amount: Optional[Money]
     rationale: str
     notice_at: Optional[datetime] = None
+    notice_sent: bool = False     # True only when a NoticeExecutor confirmed dispatch
 
 
 class RecoveryEngine:
     """Runs a bounded, compliant recovery workflow for one leak."""
 
-    def __init__(self, executor: RecoveryExecutor, config: RecoveryConfig = DEFAULT_CONFIG) -> None:
+    def __init__(self, executor: RecoveryExecutor, config: RecoveryConfig = DEFAULT_CONFIG,
+                 notice_executor: "Optional[NoticeExecutor]" = None) -> None:
         self._executor = executor
         self._config = config
+        self._notice_executor = notice_executor
 
     def recover(self, leak: LeakRecord, reason: FailureReason, base_time: datetime) -> RecoveryOutcome:
         if not isinstance(base_time, datetime):
@@ -142,7 +171,34 @@ class RecoveryEngine:
                                    f"unknown failure cause ({reason.value}); escalate to human", None)
 
         # TEMPORARY -> bounded, compliant retry sequence.
-        notice_at = base_time  # pre-debit notice sent at base_time; attempts follow the window
+        limit = cfg.afa_limit
+        if (limit is not None and leak.amount.currency == limit.currency
+                and leak.amount > limit):
+            return RecoveryOutcome(
+                leak, RecoveryState.HALTED, (), None,
+                f"amount {leak.amount} exceeds the AFA-free ceiling {limit}; "
+                "a recurring debit this size needs customer authentication -- handed to a human",
+                None)
+
+        # The RBI pre-debit notice. With a NoticeExecutor this is dispatched for
+        # real and the retry window starts from a notice that actually went out;
+        # without one the window is only *modelled*, which the outcome records
+        # honestly via notice_sent.
+        notice_at = base_time
+        notice_sent = False
+        if self._notice_executor is not None:
+            try:
+                notice_sent = bool(self._notice_executor.send(
+                    leak, notice_at, f"{leak.id}:notice"))
+            except RecoveryError:
+                return RecoveryOutcome(leak, RecoveryState.HALTED, (), None,
+                                       "pre-debit notice could not be sent; halted for human "
+                                       "(no debit without notice)", notice_at)
+            if not notice_sent:
+                return RecoveryOutcome(leak, RecoveryState.HALTED, (), None,
+                                       "pre-debit notice was rejected; halted for human "
+                                       "(no debit without notice)", notice_at)
+
         attempts: list[RecoveryAttempt] = []
         for k in range(cfg.max_attempts):
             at = base_time + timedelta(hours=cfg.notice_hours + k * cfg.gap_hours)
@@ -152,19 +208,49 @@ class RecoveryEngine:
                 result = self._executor.attempt(leak, channel, at, key)
             except RecoveryError:
                 return RecoveryOutcome(leak, RecoveryState.HALTED, tuple(attempts), None,
-                                       "executor error; halted for human", notice_at)
+                                       "executor error; halted for human", notice_at,
+                                       notice_sent)
             attempts.append(RecoveryAttempt(k, channel, at, key, result))
             if result is AttemptResult.SUCCEEDED:
                 return RecoveryOutcome(leak, RecoveryState.RECOVERED, tuple(attempts),
-                                       leak.amount, f"recovered on attempt {k + 1}", notice_at)
+                                       leak.amount, f"recovered on attempt {k + 1}", notice_at,
+                                       notice_sent)
 
         return RecoveryOutcome(leak, RecoveryState.EXHAUSTED, tuple(attempts), None,
-                               "all attempts failed; stopping rule reached", notice_at)
+                               "all attempts failed; stopping rule reached", notice_at,
+                               notice_sent)
 
 
 # --------------------------------------------------------------------------
 # Deterministic fake executors — for tests and offline defaults.
 # --------------------------------------------------------------------------
+@dataclass
+class AlwaysNotifies:
+    """Notice always goes out."""
+
+    sent: list = field(default_factory=list)
+
+    def send(self, leak, at_time, idempotency_key) -> bool:
+        self.sent.append((leak.id, at_time, idempotency_key))
+        return True
+
+
+@dataclass
+class NeverNotifies:
+    """Notice is rejected — no debit may follow."""
+
+    def send(self, leak, at_time, idempotency_key) -> bool:
+        return False
+
+
+@dataclass
+class RaisingNotifier:
+    """The notice channel itself is down."""
+
+    def send(self, leak, at_time, idempotency_key) -> bool:
+        raise RecoveryError("notice channel unavailable")
+
+
 @dataclass
 class AlwaysSucceedsExecutor:
     def attempt(self, leak, channel, at_time, idempotency_key) -> AttemptResult:

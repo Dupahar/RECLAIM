@@ -18,12 +18,12 @@ These principles are elaborated in the architecture document (`../RECLAIM-System
 
 ```
 reclaim-engine/
-  src/reclaim/            # the engine — 19 modules, importable package, zero runtime deps
-  tests/                  # pytest suite (mirrors src) — 27 files, 338 tests
+  src/reclaim/            # the engine — 22 modules, importable package, zero runtime deps
+  tests/                  # pytest suite (mirrors src) — 30 files, 420 tests
   docs/
     RUNBOOK.md            # one-page reproducible demo (commands + expected output)
     BUILD-LOG.md          # chronological log of what was built & tested
-    decisions/            # 16 Architecture Decision Records (ADRs)
+    decisions/            # 21 Architecture Decision Records (ADRs)
   examples/
     sample_batch.json     # the demo batch (amounts as strings → exact Money)
     sample_batch.csv      # the same batch as CSV (a test asserts they parse identically)
@@ -63,8 +63,14 @@ suite was re-run before the next began. Full narrative in [`docs/BUILD-LOG.md`](
 | post-review | `pipeline` | `closure_rate` alongside `match_rate` — detection vs closure, kept separate |
 | post-review | `cli` | Anchored replay: `--store` publishes `root.txt`; an unanchored `--replay` is refused |
 | post-review | `persistence` | Re-persisting the same run is a no-op, so a re-run never looks like tampering |
+| 18 | `probabilistic` | Blocking derived from the scoring weights — provably lossless candidate generation |
+| 19 | `leak_ledger` | Append-only, versioned Leak Ledger: the reconciliation ↔ recovery seam |
+| 20 | `audit` | RFC 6962 consistency proofs + a published head history (`roots.log`) |
+| 21 | `recovery` | `NoticeExecutor` seam (no debit without notice) + the RBI AFA ceiling |
+| 22 | `measurement` | Deterministic holdout cohorts and causal lift (goal G9) |
+| 23 | `scorecard` | The five-part ungameable scorecard |
 
-Each significant decision is an ADR in [`docs/decisions/`](docs/decisions/) (16 records).
+Each significant decision is an ADR in [`docs/decisions/`](docs/decisions/) (21 records).
 
 ## Reproducible demo
 
@@ -81,7 +87,7 @@ python -m pytest -v         # verbose
 python -m pytest --cov=reclaim --cov-branch    # coverage (line + branch)
 ```
 
-All tests must pass before any phase is considered complete. The suite runs **338 tests at
+All tests must pass before any phase is considered complete. The suite runs **420 tests at
 100% line + branch coverage**.
 
 ## Running the engine
@@ -117,7 +123,9 @@ python -m reclaim --replay ./runstore --key-file key.bin     # anchor by HMAC si
 
 **A replay must be anchored.** Verification recomputes the Merkle root from whatever is stored, so a
 log with events deleted simply re-roots itself and its inclusion proofs still pass. Comparing
-against a root recorded *outside* the log is the only thing that detects that. If none of
+against a root recorded *outside* the log is the only thing that detects that. `--store` also
+appends each published head to `roots.log`, and `--replay` proves the log is an append-only
+extension of every one — which catches a rewrite that refreshed `root.txt` too. If none of
 `root.txt`, `--expect-root` or `--key-file` is available, `--replay` refuses and exits `2` rather
 than reporting a verdict it cannot justify ([ADR-0015](docs/decisions/ADR-0015-anchored-replay.md)).
 

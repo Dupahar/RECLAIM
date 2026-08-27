@@ -83,6 +83,92 @@ def _verify_path(leaf_hash: bytes, path: list[tuple[bytes, bool]], root: bytes) 
     return r == root
 
 
+def _subproof(m: int, leaf_hashes: list[bytes], is_full_subtree: bool) -> list[bytes]:
+    """RFC 6962 SUBPROOF(m, D[n], b) — the recursive half of a consistency proof."""
+    n = len(leaf_hashes)
+    if m == n:
+        # The old tree is exactly this subtree. Its root only needs sending when
+        # this subtree is not already known to the verifier.
+        return [] if is_full_subtree else [_mth(leaf_hashes)]
+    k = _largest_power_of_two_less_than(n)
+    if m <= k:
+        # The old tree lives entirely in the left subtree; the right subtree is
+        # wholly new, so its root is enough to describe the growth.
+        return _subproof(m, leaf_hashes[:k], is_full_subtree) + [_mth(leaf_hashes[k:])]
+    # The old tree spans the split: recurse right, and send the (complete,
+    # unchanged) left subtree root.
+    return _subproof(m - k, leaf_hashes[k:], False) + [_mth(leaf_hashes[:k])]
+
+
+def _consistency_path(leaf_hashes: list[bytes], m: int) -> list[bytes]:
+    """RFC 6962 PROOF(m, D[n]): evidence that D[n] extends D[m] by appending."""
+    n = len(leaf_hashes)
+    if m == 0 or m > n:
+        return []
+    if m == n:
+        return []
+    return _subproof(m, leaf_hashes, True)
+
+
+def _verify_consistency(m: int, n: int, proof: list[bytes],
+                        old_root: bytes, new_root: bytes) -> bool:
+    """Recompute both roots from one proof; they must match what was published.
+
+    The point of the exercise: a consistency proof establishes that nothing in
+    the first ``m`` entries was edited, reordered or removed on the way to ``n``
+    — the property an inclusion proof cannot express, because a rewritten log is
+    perfectly self-consistent.
+    """
+    if m > n or m < 0:
+        return False
+    if m == n:
+        return not proof and old_root == new_root
+    if m == 0:
+        return not proof                      # every tree extends the empty tree
+
+    node, last_node = m - 1, n - 1
+    while node & 1:                           # climb out of right-child positions
+        node >>= 1
+        last_node >>= 1
+
+    remaining = list(proof)
+
+    def take():
+        return remaining.pop(0) if remaining else None
+
+    if node:
+        first = take()                        # m is not a power of two
+        if first is None:
+            return False
+        old_hash = new_hash = first
+    else:
+        old_hash = new_hash = old_root        # m is a power of two: subtree root is the old root
+
+    while node:
+        if node & 1:                          # right child -> sibling on the left
+            sibling = take()
+            if sibling is None:
+                return False
+            old_hash = _node_hash(sibling, old_hash)
+            new_hash = _node_hash(sibling, new_hash)
+        elif node < last_node:                # left child that gained a right sibling
+            sibling = take()
+            if sibling is None:
+                return False
+            new_hash = _node_hash(new_hash, sibling)
+        node >>= 1
+        last_node >>= 1
+
+    while last_node:                          # absorb the rest of the new tree
+        sibling = take()
+        if sibling is None:
+            return False
+        new_hash = _node_hash(new_hash, sibling)
+        last_node >>= 1
+
+    return not remaining and old_hash == old_root and new_hash == new_root
+
+
 @dataclass(frozen=True)
 class AuditEvent:
     kind: str
@@ -130,6 +216,33 @@ class MerkleAuditLog:
         if not (0 <= index < self.size):
             raise IndexError(f"index {index} out of range 0..{self.size - 1}")
         return [(sib.hex(), is_left) for sib, is_left in _audit_path(self._leaves, index)]
+
+    def consistency_proof(self, old_size: int) -> list[str]:
+        """Prove the log at ``old_size`` is a prefix of the log as it stands now.
+
+        This is the half of RFC 6962 that catches rewriting. An inclusion proof
+        only shows an event belongs to *some* tree with a given root — delete an
+        entry and the survivors still prove inclusion in the smaller tree they
+        now form. A consistency proof is what shows the old root and the new
+        root belong to the *same append-only history*.
+        """
+        if not (0 <= old_size <= self.size):
+            raise IndexError(f"old_size {old_size} out of range 0..{self.size}")
+        return [h.hex() for h in _consistency_path(self._leaves, old_size)]
+
+    def verify_consistency(self, old_size: int, old_root_hex: str,
+                           proof: list[str], new_root_hex: str | None = None) -> bool:
+        """Check a consistency proof between ``old_root`` and this log's root."""
+        if not (0 <= old_size <= self.size):
+            return False
+        new_root_hex = new_root_hex if new_root_hex is not None else self.root()
+        try:
+            old_root = bytes.fromhex(old_root_hex)
+            new_root = bytes.fromhex(new_root_hex)
+            path = [bytes.fromhex(h) for h in proof]
+        except ValueError:
+            return False
+        return _verify_consistency(old_size, self.size, path, old_root, new_root)
 
     def verify_inclusion(self, event: AuditEvent, index: int,
                          proof: list[tuple[str, bool]], root_hex: str) -> bool:

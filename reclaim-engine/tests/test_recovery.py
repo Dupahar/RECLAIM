@@ -144,3 +144,89 @@ def test_sequence_executor_exhaustion():
     ex.attempt(None, Channel.UPI_RETRY, BASE, "k0")
     with pytest.raises(RecoveryError):
         ex.attempt(None, Channel.UPI_RETRY, BASE, "k1")
+
+
+# --------------------------------------------------------------------------
+# Phase 21 — the pre-debit notice becomes an action, and the AFA ceiling
+# --------------------------------------------------------------------------
+from reclaim.recovery import AlwaysNotifies, NeverNotifies, RaisingNotifier
+
+
+def test_notice_is_dispatched_before_any_debit():
+    notifier = AlwaysNotifies()
+    engine = RecoveryEngine(AlwaysSucceedsExecutor(), notice_executor=notifier)
+    out = engine.recover(leak(), FailureReason.INSUFFICIENT_FUNDS, BASE)
+    assert out.final_state is RecoveryState.RECOVERED
+    assert out.notice_sent is True
+    assert len(notifier.sent) == 1
+    leak_id, at_time, key = notifier.sent[0]
+    assert at_time == BASE                            # notice at t0...
+    assert out.attempts[0].at_time == BASE + timedelta(hours=24)   # ...debit 24h later
+    assert key == f"{leak_id}:notice"               # idempotent: one notice per leak
+
+
+def test_without_a_notice_executor_the_window_is_only_modelled():
+    """Honest reporting: no executor means no notice was actually sent."""
+    out = RecoveryEngine(AlwaysSucceedsExecutor()).recover(
+        leak(), FailureReason.INSUFFICIENT_FUNDS, BASE)
+    assert out.final_state is RecoveryState.RECOVERED
+    assert out.notice_at == BASE
+    assert out.notice_sent is False
+
+
+def test_rejected_notice_halts_before_debiting():
+    engine = RecoveryEngine(AlwaysSucceedsExecutor(), notice_executor=NeverNotifies())
+    out = engine.recover(leak(), FailureReason.INSUFFICIENT_FUNDS, BASE)
+    assert out.final_state is RecoveryState.HALTED
+    assert out.attempts == ()                       # nothing was charged
+    assert "no debit without notice" in out.rationale
+
+
+def test_notice_channel_failure_halts_before_debiting():
+    engine = RecoveryEngine(AlwaysSucceedsExecutor(), notice_executor=RaisingNotifier())
+    out = engine.recover(leak(), FailureReason.INSUFFICIENT_FUNDS, BASE)
+    assert out.final_state is RecoveryState.HALTED
+    assert out.attempts == ()
+    assert out.recovered_amount is None
+
+
+def test_amount_above_the_afa_ceiling_is_never_auto_debited():
+    """RBI e-mandate: above the ceiling a debit needs customer authentication."""
+    big = leak(amount="15000.01")
+    out = RecoveryEngine(AlwaysSucceedsExecutor()).recover(
+        big, FailureReason.INSUFFICIENT_FUNDS, BASE)
+    assert out.final_state is RecoveryState.HALTED
+    assert out.attempts == ()
+    assert "AFA-free ceiling" in out.rationale
+
+
+def test_amount_at_the_afa_ceiling_is_still_allowed():
+    out = RecoveryEngine(AlwaysSucceedsExecutor()).recover(
+        leak(amount="15000.00"), FailureReason.INSUFFICIENT_FUNDS, BASE)
+    assert out.final_state is RecoveryState.RECOVERED
+
+
+def test_afa_ceiling_can_be_disabled_or_retuned():
+    big = leak(amount="99999.00")
+    off = RecoveryEngine(AlwaysSucceedsExecutor(), RecoveryConfig(afa_limit=None))
+    assert off.recover(big, FailureReason.INSUFFICIENT_FUNDS, BASE).final_state is RecoveryState.RECOVERED
+    tighter = RecoveryEngine(AlwaysSucceedsExecutor(),
+                             RecoveryConfig(afa_limit=Money.of("100", "INR")))
+    assert tighter.recover(leak(amount="500.00"), FailureReason.INSUFFICIENT_FUNDS,
+                           BASE).final_state is RecoveryState.HALTED
+
+
+def test_afa_ceiling_ignores_a_different_currency():
+    """A rupee ceiling says nothing about a dollar debit — don't guess a rate."""
+    usd = LeakRecord(id="L-usd", amount=Money.of("50000.00", "USD"),
+                     leak_type=LeakType.SHORT_PAYMENT, source_refs=("s1",), recoverable=True)
+    out = RecoveryEngine(AlwaysSucceedsExecutor()).recover(
+        usd, FailureReason.INSUFFICIENT_FUNDS, BASE)
+    assert out.final_state is RecoveryState.RECOVERED
+
+
+def test_afa_limit_validation():
+    with pytest.raises(RecoveryError):
+        RecoveryConfig(afa_limit="15000")
+    with pytest.raises(RecoveryError):
+        RecoveryConfig(afa_limit=Money.of("0", "INR"))

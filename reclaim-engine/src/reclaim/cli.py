@@ -16,7 +16,7 @@ from datetime import datetime
 from .batch_io import BatchLoadError, load_batch_file
 from .csv_io import load_batch_csv
 from .ledger import LedgerError
-from .persistence import JsonlFileStore, PersistenceError
+from .persistence import AuditRepository, JsonlFileStore, LeakRepository, PersistenceError
 from .pipeline import persist_run, run_reclaim
 from .reconciliation import ReconciliationError
 from .signing import SigningError, signed_root_record, verify_signed_record
@@ -24,6 +24,7 @@ from .verification import VerificationResult, verify_stores
 
 
 ROOT_FILE = "root.txt"
+HEADS_FILE = "roots.log"   # append-only history of published (size, root) heads
 
 
 def _print_human(rep) -> None:
@@ -66,6 +67,9 @@ def _print_verify(res: VerificationResult, source, anchor: str) -> None:
     print(f"  inclusion proofs : {'ok' if res.proofs_ok else 'FAILED'}")
     if res.root_matches_expected is not None:
         print(f"  root matches     : {res.root_matches_expected}")
+    if res.consistency_ok is not None:
+        verdict = "ok" if res.consistency_ok else "FAILED"
+        print(f"  append-only      : {verdict} (vs {res.heads_checked} published head/s)")
 
 
 def _load_key(key_file):
@@ -78,6 +82,25 @@ def _load_key(key_file):
     if len(key) == 0:
         raise SigningError(f"key file is empty: {key_file}")
     return key
+
+
+def _read_heads(d: pathlib.Path):
+    """Previously published (size, root) heads, oldest first.
+
+    Each ``--store`` appends the tree head it published. Keeping the history —
+    rather than only the latest root — is what makes a *consistency* check
+    possible: the current log must be an append-only extension of every head
+    that was ever published, not merely self-consistent today.
+    """
+    path = d / HEADS_FILE
+    if not path.exists():
+        return []
+    heads = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0].isdigit():
+            heads.append((int(parts[0]), parts[1]))
+    return heads
 
 
 def _resolve_anchor(d: pathlib.Path, expect_root, key):
@@ -120,7 +143,7 @@ def _do_replay(replay_dir: str, expect_root, key) -> int:
         return 2
     try:
         res = verify_stores(JsonlFileStore(ledger_file), JsonlFileStore(audit_file),
-                            expect_root=expect_root)
+                            expect_root=expect_root, prior_heads=_read_heads(d))
     except (PersistenceError, LedgerError) as exc:
         print("replay verification: FAILED", file=sys.stderr)
         print(f"  error: {exc}", file=sys.stderr)
@@ -193,17 +216,34 @@ def main(argv=None) -> int:
     if args.store:
         store_dir = pathlib.Path(args.store)
         store_dir.mkdir(parents=True, exist_ok=True)
+        leak_file = store_dir / "leaks.jsonl"
         audit = persist_run(rep, at or datetime(1970, 1, 1),
                             JsonlFileStore(store_dir / "ledger.jsonl"),
-                            JsonlFileStore(store_dir / "audit.jsonl"))
+                            JsonlFileStore(store_dir / "audit.jsonl"),
+                            JsonlFileStore(leak_file))
+        open_count = len(LeakRepository(JsonlFileStore(leak_file)).load().open_queue())
+        # Publish the head of the *store*, not of this run own log. A store
+        # accumulates across runs, so the two diverge as soon as a second batch
+        # lands in the same directory -- and it is the store that --replay reads.
+        stored = AuditRepository(JsonlFileStore(store_dir / "audit.jsonl")).load()
+        stored_root, stored_size = stored.root(), stored.size
         print(f"persisted: {len(rep.ledger.postings())} postings, {audit.size} audit events "
-              f"-> {store_dir}  (audit root {audit.root()[:16]}...)")
+              f"-> {store_dir}  (store now {stored_size} events, root {stored_root[:16]}...)")
+        print(f"leak ledger: {len(rep.exact.leaks)} leaks, {open_count} still open "
+              f"-> {leak_file}")
         # Publish the root next to the run so a later --replay is anchored by
         # default. Keep it somewhere tamper-visible (VCS, a ticket) too.
-        (store_dir / ROOT_FILE).write_text(audit.root() + "\n", encoding="utf-8", newline="\n")
-        print(f"published: {store_dir / ROOT_FILE} (anchors --replay)")
+        (store_dir / ROOT_FILE).write_text(stored_root + "\n", encoding="utf-8", newline="\n")
+        heads_path = store_dir / HEADS_FILE
+        head_line = f"{stored_size} {stored_root}\n"
+        existing = heads_path.read_text(encoding="utf-8") if heads_path.exists() else ""
+        if head_line not in existing:        # idempotent, like the stores themselves
+            with heads_path.open("a", encoding="utf-8", newline="\n") as fh:
+                fh.write(head_line)
+        print(f"published: {store_dir / ROOT_FILE} (anchors --replay), "
+              f"head appended to {heads_path.name}")
         if key is not None:
-            record = signed_root_record(audit.root(), key)
+            record = signed_root_record(stored_root, key)
             (store_dir / "audit.sig").write_text(json.dumps(record), encoding="utf-8")
             print(f"signed: audit.sig written ({record['algo']}, sig {record['signature'][:16]}...)")
     return 0

@@ -254,3 +254,61 @@ def test_ledger_repository_save_is_idempotent():
     repo.save_posting(posting())
     assert len(store.read()) == 1
     assert len(repo.load().postings()) == 1
+
+
+# --------------------------------------------------------------------------
+# Leak Ledger durability (Phase 19)
+# --------------------------------------------------------------------------
+from reclaim.domain import LeakRecord, LeakType, RecoveryState
+from reclaim.leak_ledger import LeakLedger
+from reclaim.persistence import LeakRepository, leak_from_record, leak_to_record
+
+
+def _leak(lid="L1", state=RecoveryState.NONE, **kw):
+    return LeakRecord(id=lid, amount=inr("250.00"), leak_type=LeakType.SHORT_PAYMENT,
+                      source_refs=("s1", "b1"), hypothesis="short by 250",
+                      recoverable=True, recovery_state=state, **kw)
+
+
+def test_leak_round_trips_through_a_record():
+    original = _leak(evidence=("bank credit 2800 < expected 3000",), audit_ref="deadbeef:2")
+    assert leak_from_record(leak_to_record(original)) == original
+
+
+def test_leak_record_rejects_corrupt_data():
+    with pytest.raises(PersistenceError):
+        leak_from_record({"id": "L1"}, "leak[0]")
+
+
+def test_leak_repository_rehydrates_state_and_history():
+    store = InMemoryStore()
+    source = LeakLedger()
+    source.record(_leak())
+    source.transition("L1", RecoveryState.RECOVERED)
+    LeakRepository(store).save_ledger(source)
+
+    reloaded = LeakRepository(store).load()
+    assert reloaded.current("L1").recovery_state is RecoveryState.RECOVERED
+    assert [v.recovery_state.value for v in reloaded.history("L1")] == ["none", "recovered"]
+    assert reloaded.version_count == source.version_count
+
+
+def test_leak_repository_save_is_idempotent():
+    store = InMemoryStore()
+    ledger = LeakLedger()
+    ledger.record(_leak())
+    LeakRepository(store).save_ledger(ledger)
+    LeakRepository(store).save_ledger(ledger)
+    assert len(store.read()) == 1
+
+
+def test_leak_repository_load_of_empty_store():
+    assert LeakRepository(InMemoryStore()).load().size == 0
+
+
+def test_leak_record_propagates_a_nested_money_error():
+    """A bad amount surfaces as the inner PersistenceError, not a re-wrap."""
+    bad = leak_to_record(_leak())
+    bad["amount"] = {"amount": "not-a-number", "currency": "INR"}
+    with pytest.raises(PersistenceError, match="invalid money"):
+        leak_from_record(bad, "leak[0]")

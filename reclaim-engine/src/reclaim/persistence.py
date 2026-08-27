@@ -21,7 +21,8 @@ from datetime import datetime
 from typing import Protocol, runtime_checkable
 
 from .audit import AuditEvent, MerkleAuditLog
-from .domain import Direction, LedgerEntry
+from .domain import Direction, LeakRecord, LeakType, LedgerEntry, RecoveryState
+from .leak_ledger import LeakLedger
 from .ledger import Ledger, Posting, LedgerError
 from .money import Money, MoneyError
 
@@ -127,6 +128,34 @@ def posting_from_record(d, where: str = "posting") -> Posting:
         raise PersistenceError(f"{where}: invalid posting ({exc})") from exc
 
 
+def leak_to_record(l: LeakRecord) -> dict:
+    return {"id": l.id, "amount": _money_to(l.amount), "leak_type": l.leak_type.value,
+            "source_refs": list(l.source_refs), "hypothesis": l.hypothesis,
+            "confidence": l.confidence, "recoverable": l.recoverable,
+            "recovery_state": l.recovery_state.value,
+            "evidence": list(l.evidence), "audit_ref": l.audit_ref}
+
+
+def leak_from_record(d, where: str = "leak") -> LeakRecord:
+    try:
+        return LeakRecord(
+            id=d["id"],
+            amount=_money_from(d["amount"], f"{where}.amount"),
+            leak_type=LeakType(d["leak_type"]),
+            source_refs=tuple(d.get("source_refs", ())),
+            hypothesis=d.get("hypothesis", ""),
+            confidence=d.get("confidence"),
+            recoverable=d.get("recoverable", False),
+            recovery_state=RecoveryState(d.get("recovery_state", "none")),
+            evidence=tuple(d.get("evidence", ())),
+            audit_ref=d.get("audit_ref"),
+        )
+    except PersistenceError:
+        raise
+    except Exception as exc:
+        raise PersistenceError(f"{where}: invalid leak record ({exc})") from exc
+
+
 def event_to_record(e: AuditEvent) -> dict:
     return {"kind": e.kind, "at": e.at.isoformat(), "detail": dict(e.detail)}
 
@@ -186,6 +215,29 @@ class LedgerRepository(_DedupingRepository):
         ledger = Ledger()
         for i, rec in enumerate(self._store.read()):
             ledger.post(posting_from_record(rec, f"posting[{i}]"))
+        return ledger
+
+
+class LeakRepository(_DedupingRepository):
+    """Persists Leak Ledger versions and rehydrates an identical LeakLedger.
+
+    Every *version* is stored, in order, so the rehydrated ledger reproduces the
+    same current state **and** the same history. Idempotent by content, so
+    re-persisting a run neither duplicates leaks nor invents a state change.
+    """
+
+    def save_leak(self, leak: LeakRecord) -> None:
+        self._append_once(leak_to_record(leak))
+
+    def save_ledger(self, ledger: LeakLedger) -> None:
+        for leak in ledger.leaks():
+            for version in ledger.history(leak.id):
+                self.save_leak(version)
+
+    def load(self) -> LeakLedger:
+        ledger = LeakLedger()
+        for i, rec in enumerate(self._store.read()):
+            ledger.record(leak_from_record(rec, f"leak[{i}]"))
         return ledger
 
 

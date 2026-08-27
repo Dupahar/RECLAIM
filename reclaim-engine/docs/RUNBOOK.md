@@ -47,12 +47,12 @@ one row exercises each path:
 
 Amounts are **strings** in the input — they become exact `Decimal` `Money`, never float.
 
-## 1. Tests — 338 passing, 100% line + branch
+## 1. Tests — 420 passing, 100% line + branch
 
 ```bash
 python -m pytest --cov=reclaim --cov-branch
 ```
-→ `TOTAL 1557 statements, 390 branches, 0 missed, 100%` · `338 passed`
+→ `TOTAL 2025 statements, 554 branches, 0 missed, 100%` · `420 passed`
 
 ## 2. Full closed loop (demo data, deterministic stand-ins for LLM + payment rail)
 
@@ -105,7 +105,8 @@ published: run/root.txt (anchors --replay)
 signed: audit.sig written (HMAC-SHA256, sig ...)
 ```
 
-Writes append-only `run/ledger.jsonl`, `run/audit.jsonl`, plus `run/root.txt` and `run/audit.sig`.
+Writes append-only `run/ledger.jsonl`, `run/audit.jsonl` and `run/leaks.jsonl` (the Leak Ledger),
+plus `run/root.txt`, `run/roots.log` (the published head history) and `run/audit.sig`.
 The root is **deterministic** — the same batch (JSON *or* CSV) always yields
 `2e01c7d00ad76c124ad0d906a78caf5f6b524aa8aacb4ea0fb70bb56027482f6`. Re-running this command against
 the same directory is a **no-op**: nothing is duplicated and the root does not move
@@ -168,6 +169,24 @@ bad signature / corrupt data) · `2` usage error, including an unanchored replay
 > commit it, file it on a ticket, or use `--key-file` and hold the key elsewhere
 > ([ADR-0015](decisions/ADR-0015-anchored-replay.md)).
 
+## 7b. The scorecard and the Leak Ledger
+
+```bash
+python -c "from reclaim.demo import run_demo; from reclaim.scorecard import build_scorecard; import json; print(json.dumps(build_scorecard(run_demo()).summary(), indent=2))"
+```
+Note two fields that stay honest by default: `causal_recovered` is `null` with the note *"no holdout
+was run, so recovery cannot be credited causally"*, and `notice_compliance` is `0.0000` because the
+demo supplies no `NoticeExecutor`. Both become real numbers only when the machinery behind them is
+actually used — see [ADR-0021](decisions/ADR-0021-causal-measurement.md).
+
+The Leak Ledger persisted in step 5 is the human queue:
+
+```bash
+python -c "from reclaim.demo import run_demo; from reclaim.pipeline import build_leak_ledger; ll = build_leak_ledger(run_demo()); print('open:', [l.id for l in ll.open_queue()]); print('states:', {l.id: l.recovery_state.value for l in ll.leaks()})"
+```
+Four leaks were detected; one was recovered, two were `superseded` by a later fuzzy match (never
+real leaks), and exactly one is open — the same single leak the report calls residual.
+
 ## 8. Reset
 
 ```bash
@@ -180,13 +199,16 @@ What this demo does **not** prove, stated plainly so nobody has to infer it:
 
 | Claim | Status |
 |---|---|
-| Detection, fee decomposition, fuzzy matching, ledger balance | **Real** — deterministic, 338 tests |
+| Detection, fee decomposition, fuzzy matching, ledger balance | **Real** — deterministic, 420 tests |
 | Merkle audit, inclusion proofs, anchored replay, tamper detection | **Real** — demonstrated in step 7 |
 | Event-sourced persistence, idempotent re-persist, byte-stable artifacts | **Real** — steps 4–6 |
 | Recovery *outcomes* (₹200 recovered) | **Simulated** — `AlwaysSucceedsExecutor`, not a payment rail |
-| RBI 24-hour pre-debit notice | **Modelled, not sent** — the time is recorded and attempts are scheduled after it; there is no notification action |
+| RBI 24-hour pre-debit notice | **Real seam, no channel wired** — with a `NoticeExecutor` the notice is dispatched and a rejected notice halts the debit; the demo supplies none, so the scorecard reports `notice_compliance: 0` |
 | LLM exception resolution | **Real code, not exercised here** — `llm_resolver` needs a key; the demo uses deterministic fakes |
-| Causal uplift / control group | **Not implemented** — no holdout, no measured lift. Sprint 2 scope |
+| Blocking, Leak Ledger, consistency proofs, AFA ceiling | **Real** — ADRs 0017–0020 |
+| Causal lift arithmetic + deterministic holdout | **Real** — `measurement`, ADR-0021 |
+| A *measured* lift figure | **Not yet produced** — cohorts are assigned and the maths is tested, but crediting real lift needs the T+1 re-reconciliation loop to observe whether held-out leaks self-resolved. Deliberately not faked |
+| Uplift model / funded-moment predictor / bandit | **Not implemented** — Sprint 3 |
 
 Both external integrations (`ChatClient` → Anthropic, `PaymentGateway` → Razorpay test mode) are
 real drop-ins behind protocol seams with deterministic fakes, which is why the whole system is
@@ -196,4 +218,4 @@ provable offline — but "provable offline" is not the same as "proven in produc
 
 **Environment used for the outputs above:** Python 3.13.9 on Windows 11; also runs on 3.11+, any OS.
 Deeper reference: [`../README.md`](../README.md) (CLI flags), [`BUILD-LOG.md`](BUILD-LOG.md)
-(what was built and how it was tested), [`decisions/`](decisions/) (16 ADRs).
+(what was built and how it was tested), [`decisions/`](decisions/) (21 ADRs).

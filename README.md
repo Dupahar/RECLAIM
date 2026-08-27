@@ -7,7 +7,7 @@
 **Find every rupee that leaks. Win back what's winnable. Prove the books closed.**
 
 ![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-338%20passing-2ea44f)
+![Tests](https://img.shields.io/badge/tests-420%20passing-2ea44f)
 ![Coverage](https://img.shields.io/badge/coverage-100%25%20line%20%2B%20branch-2ea44f)
 ![License](https://img.shields.io/badge/license-MIT-0b3b8f)
 ![Status](https://img.shields.io/badge/build-passing-2ea44f)
@@ -58,7 +58,9 @@ A single system that **detects every leak, recovers what's recoverable within co
 - **Durable & replayable** — event-sourced persistence; re-persisting a run is a no-op, and a stored run can be re-verified and tamper-detected at any time.
 - **…or nothing** — a replay with no trust anchor is *refused*, not passed. A Merkle log re-roots
   itself after tampering, so self-consistency alone proves nothing, and we don't pretend otherwise.
-- **Fully tested** — 19 modules, **338 tests, 100% line + branch coverage**, zero runtime dependencies.
+- **Measured, not asserted** — recovery is credited against a held-out control group, or reported
+  as uncountable. Gross recovery is never presented as causal impact.
+- **Fully tested** — 22 modules, **420 tests, 100% line + branch coverage**, zero runtime dependencies.
 
 ## The loop
 
@@ -85,7 +87,7 @@ flowchart LR
 ```bash
 cd reclaim-engine
 
-python -m pytest --cov=reclaim --cov-branch      # 338 tests, 100% line + branch
+python -m pytest --cov=reclaim --cov-branch      # 420 tests, 100% line + branch
 python -m reclaim.demo                            # run the full loop (demo data)
 python -m reclaim examples/sample_batch.json      # reconcile a JSON batch
 python -m reclaim --csv examples/sample_batch.csv # …or CSV
@@ -98,10 +100,12 @@ python -m reclaim examples/sample_batch.json --store ./run --key-file key.bin
 python -m reclaim --replay ./run --key-file key.bin        # anchored by run/root.txt
 ```
 
-`--store` publishes the audit root to `run/root.txt`, which anchors a later `--replay`. A replay with
-no anchor (`root.txt`, `--expect-root`, or `--key-file`) **refuses and exits 2** — deleting audit
+`--store` publishes the audit root to `run/root.txt` and appends the tree head to `run/roots.log`.
+A later `--replay` checks both: the root still matches, **and** the log is an append-only extension
+of every head ever published. A replay with no anchor **refuses and exits 2** — deleting audit
 events lets a Merkle log recompute a valid root of the survivors, so an unanchored replay cannot
-detect tampering ([ADR-0015](reclaim-engine/docs/decisions/ADR-0015-anchored-replay.md)).
+detect tampering ([ADR-0015](reclaim-engine/docs/decisions/ADR-0015-anchored-replay.md),
+[ADR-0019](reclaim-engine/docs/decisions/ADR-0019-consistency-proofs.md)).
 
 Open `reclaim-engine/examples/demo_dashboard.html` for the visual run report.
 
@@ -129,34 +133,38 @@ flowchart LR
     subgraph D["1 · DETECT — two-brain reconciliation"]
         direction TB
         EX["<b>reconciliation</b><br/>exact gate: UTR + amount<br/>after fee decomposition<br/>emits typed leaks"]
+        BK["<b>blocking</b><br/>candidate generation<br/>derived from the weights<br/><i>provably lossless</i>"]
         FZ["<b>probabilistic</b><br/>Fellegi-Sunter linkage<br/>auto / review / residual"]
         AI["<b>resolver</b><br/>gated AI: self-consistency<br/>+ confidence + refute-first<br/>verifier"]
-        EX -->|"no exact match"| FZ
+        EX -->|"no exact match"| BK
+        BK --> FZ
         FZ -->|"review band"| AI
     end
 
     subgraph R["2 · RECOVER"]
         direction TB
-        RC["<b>recovery</b><br/>root-cause diagnosis<br/>RBI 24h notice · capped<br/>attempts · stopping rules<br/>· idempotent"]
+        RC["<b>recovery</b><br/>root-cause diagnosis<br/>RBI 24h notice · AFA ceiling<br/>capped attempts · stopping<br/>rules · idempotent"]
     end
 
     LG["<b>3 · BOOK</b><br/><br/><b>ledger</b><br/>immutable<br/>double-entry<br/><br/>debits = credits"]
+    LL["<b>leak_ledger</b><br/>append-only, versioned<br/>the recon ↔ recovery seam"]
 
     subgraph P["4 · PROVE"]
         direction TB
-        AU["<b>audit</b><br/>Merkle log<br/>+ inclusion proofs"]
+        AU["<b>audit</b><br/>Merkle log<br/>inclusion + consistency<br/>proofs"]
         SG["<b>signing</b><br/>HMAC-SHA256<br/>over the root"]
         PS["<b>persistence</b><br/>event-sourced<br/>append-only JSONL"]
-        VF["<b>verification</b><br/>replay + tamper<br/>detection"]
+        VF["<b>verification</b><br/>replay + tamper<br/>detection<br/><i>anchored + append-only</i>"]
         AU --> SG
         PS --> VF
     end
 
-    OUT["<b>5 · REPORT</b><br/><br/><b>pipeline · cli<br/>dashboard</b><br/><br/>match rate<br/>→ ₹ recovered<br/>→ residual"]
+    OUT["<b>5 · REPORT</b><br/><br/><b>pipeline · cli · dashboard<br/>scorecard · measurement</b><br/><br/>match rate → closure rate<br/>→ ₹ <i>causally</i> recovered<br/>→ residual"]
     HUM["<b>Human queue</b><br/>honest exception list<br/><i>never a guess</i>"]
 
     LLM["<b>ChatClient</b> seam<br/><i>llm_resolver</i><br/>→ Anthropic Claude"]
     PAY["<b>PaymentGateway</b> seam<br/><i>payments</i><br/>→ Razorpay test mode"]
+    NOT["<b>NoticeExecutor</b> seam<br/><i>recovery</i><br/>→ pre-debit notice"]
 
     IN --> IO
     MO --> EX
@@ -165,6 +173,9 @@ flowchart LR
     AI -->|"confirmed"| LG
     AI -->|"uncertain / any error"| HUM
     EX -->|"recoverable leak"| RC
+    EX -->|"every leak, typed"| LL
+    RC -->|"outcome written back"| LL
+    LL --> HUM
     RC -->|"recovered"| LG
     RC -->|"exhausted / dead mandate"| HUM
     LG --> AU
@@ -175,6 +186,7 @@ flowchart LR
 
     LLM -.->|"plugs in"| AI
     PAY -.->|"plugs in"| RC
+    NOT -.->|"plugs in"| RC
 
     classDef found fill:#eef2f8,stroke:#6a768c,color:#14203a
     classDef detect fill:#eaf1ff,stroke:#2f6fd0,color:#14203a
@@ -186,9 +198,10 @@ flowchart LR
     class IO,MO found
     class EX,FZ,AI detect
     class RC recov
-    class LG book
+    class LG,LL book
+    class BK detect
     class AU,SG,PS,VF prove
-    class LLM,PAY seam
+    class LLM,PAY,NOT seam
     class IN,OUT,HUM edge
 
     style F fill:#fbfcfe,stroke:#c3cbd9,stroke-width:1px,color:#6a768c
@@ -210,11 +223,13 @@ everything the engine *couldn't* settle sent to a human rather than guessed.
 | Domain | `domain` | Canonical Transaction / Fees / LedgerEntry / LeakRecord |
 | I/O | `batch_io` · `csv_io` | Validating JSON / CSV boundary (amounts as strings → exact `Money`) |
 | Ledger | `ledger` | Immutable, idempotent double-entry ledger (`debits == credits`) |
+| Ledger | `leak_ledger` | Append-only versioned store of every leak; the recon↔recovery seam |
 | Detect | `reconciliation` | Exact settlement↔bank matching + typed leak detection |
 | Detect | `probabilistic` | Fellegi-Sunter-style fuzzy matcher (auto / review / residual) |
 | Detect | `resolver` · `llm_resolver` | Gated resolver (self-consistency + confidence + adversarial verifier); LLM backend |
 | Recover | `recovery` · `payments` | Diagnosis + bounded compliant workflow; payment-gateway executor |
-| Integrity | `audit` · `signing` | Merkle transparency log + inclusion proofs; HMAC signing |
+| Integrity | `audit` · `signing` | Merkle log with inclusion **and consistency** proofs; HMAC signing |
+| Measure | `measurement` · `scorecard` | Holdout cohorts, causal lift, the five-part scorecard |
 | Durability | `persistence` · `verification` | Event-sourced storage; replay + tamper verification |
 | Orchestration | `pipeline` · `cli` · `dashboard` · `demo` | End-to-end run, CLI, HTML report, runnable demo |
 
@@ -222,23 +237,26 @@ everything the engine *couldn't* settle sent to a human rather than guessed.
 (after recovery). They are kept separate on purpose — one number cannot show that recovery moved
 anything ([ADR-0014](reclaim-engine/docs/decisions/ADR-0014-closure-rate.md)).
 
-Every significant design decision is recorded as an Architecture Decision Record in [`reclaim-engine/docs/decisions/`](reclaim-engine/docs/decisions/) (16 ADRs).
+Every significant design decision is recorded as an Architecture Decision Record in [`reclaim-engine/docs/decisions/`](reclaim-engine/docs/decisions/) (21 ADRs).
 
 ## Repository layout
 
 ```
 .
 ├── reclaim-engine/                     the engine — Python 3.11+, src layout, zero runtime deps
-│   ├── src/reclaim/                    19 modules
+│   ├── src/reclaim/                    22 modules
 │   │   ├── money.py  domain.py         exact Decimal money + canonical types
 │   │   ├── ledger.py                   immutable double-entry ledger
+│   │   ├── leak_ledger.py              append-only versioned store of every leak
 │   │   ├── reconciliation.py           exact matching + typed leak detection
 │   │   ├── probabilistic.py            Fellegi-Sunter fuzzy linkage
 │   │   ├── resolver.py                 gated AI resolver (protocol + verifier)
 │   │   ├── llm_resolver.py             LLM backend behind the ChatClient seam
 │   │   ├── recovery.py                 bounded, compliant, idempotent recovery
 │   │   ├── payments.py                 gateway executor behind the PaymentGateway seam
-│   │   ├── audit.py  signing.py        Merkle transparency log + HMAC signing
+│   │   ├── audit.py  signing.py        Merkle log (inclusion + consistency) + signing
+│   │   ├── measurement.py              holdout cohorts + causal lift
+│   │   ├── scorecard.py                the five-part ungameable scorecard
 │   │   ├── persistence.py              event-sourced append-only storage
 │   │   ├── verification.py             replay + tamper detection
 │   │   ├── batch_io.py  csv_io.py      validating JSON / CSV input boundary
@@ -246,11 +264,11 @@ Every significant design decision is recorded as an Architecture Decision Record
 │   │   ├── cli.py  __main__.py         `python -m reclaim`
 │   │   ├── dashboard.py                self-contained HTML run report
 │   │   └── demo.py                     `python -m reclaim.demo`
-│   ├── tests/                          27 files · 338 tests · 100% line + branch
+│   ├── tests/                          30 files · 420 tests · 100% line + branch
 │   ├── docs/
 │   │   ├── RUNBOOK.md                  one-page reproducible demo
 │   │   ├── BUILD-LOG.md                what was built, why, how it was tested
-│   │   └── decisions/                  16 Architecture Decision Records
+│   │   └── decisions/                  21 Architecture Decision Records
 │   ├── examples/                       sample_batch.json · .csv · demo_dashboard.html/.png
 │   ├── pyproject.toml                  project + pytest/coverage config
 │   └── README.md                       engine-level docs
@@ -273,9 +291,12 @@ Stated plainly so nobody has to infer it from the code.
 | Event-sourced persistence, idempotent re-persist, byte-stable artifacts | **Real** |
 | Gated AI exception resolution | **Real code** — `llm_resolver` is a working Anthropic backend; the offline demo uses deterministic fakes |
 | Payment execution | **Seam only** — `payments` wraps a real Razorpay test-mode client, but the demo runs a stand-in executor |
+| Blocking, Leak Ledger, consistency proofs, AFA ceiling | **Real** — see ADRs 0017–0020 |
+| Causal lift arithmetic + deterministic holdout | **Real** — `measurement`, ADR-0021 |
 | **Recovered ₹ figures in the demo** | **Simulated** — a deterministic stand-in decides success; no money moves |
-| **RBI 24-hour pre-debit notice** | **Modelled, not sent** — the notice time is recorded and attempts are scheduled after it; there is no notification action or notice executor |
-| **Causal uplift / control group** | **Not implemented** — no holdout assignment, no measured lift. Sprint 2 scope |
+| **RBI 24-hour pre-debit notice** | **Real seam, not wired to a channel** — with a `NoticeExecutor` the notice is dispatched and a failure halts the debit; the demo supplies none, so `notice_compliance` reads 0 |
+| **A measured lift figure** | **Not yet produced** — cohorts are assigned and the maths is tested, but crediting real lift needs the T+1 re-reconciliation loop to observe whether held-out leaks self-resolved. Not faked |
+| **Uplift model / funded-moment predictor / bandit** | **Not implemented** — Sprint 3 |
 
 The recovery *workflow* — root-cause diagnosis, the 24-hour window, capped attempts, channel
 rotation, stopping rules, idempotency keys — is real, tested, and enforced in code. What is
