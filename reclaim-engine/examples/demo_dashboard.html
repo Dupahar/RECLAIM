@@ -4,14 +4,23 @@ body { font-family: 'Segoe UI', Arial, sans-serif; margin: 0; background: #eef2f
 .wrap { max-width: 960px; margin: 0 auto; padding: 28px 20px 48px; }
 h1 { color: #0b3b8f; margin: 0 0 2px; letter-spacing: 2px; }
 .sub { color: #556; margin: 0 0 22px; }
-.cards { display: flex; flex-wrap: wrap; gap: 14px; margin-bottom: 22px; }
-.card { flex: 1 1 180px; background: #fff; border: 1px solid #d7deea; border-radius: 10px; padding: 16px 18px; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 14px; margin-bottom: 22px; }
+.card { background: #fff; border: 1px solid #d7deea; border-radius: 10px; padding: 16px 18px; }
 .card .label { font-size: 12px; text-transform: uppercase; letter-spacing: .5px; color: #6a768c; }
-.card .value { font-size: 26px; font-weight: 700; color: #0b3b8f; margin-top: 4px; }
+.card .value { font-size: 21px; font-weight: 700; color: #0b3b8f; margin-top: 4px; white-space: nowrap; }
 .card.good .value { color: #1a7f4b; }
 .card.warn .value { color: #b8531a; }
-.bar { height: 12px; background: #dbe3f0; border-radius: 6px; overflow: hidden; margin: 6px 0 22px; }
-.bar > span { display: block; height: 100%; background: linear-gradient(90deg,#0b3b8f,#2f6fd0); }
+.card.hero { border-color: #0b3b8f; box-shadow: inset 3px 0 0 #0b3b8f; }
+.bar { height: 12px; background: #dbe3f0; border-radius: 6px; overflow: hidden; margin: 6px 0 8px; display: flex; gap: 2px; }
+.bar > span { display: block; height: 100%; }
+.bar .seg-m { background: #2f6fd0; border-radius: 6px 0 0 6px; }
+.bar .seg-r { background: #1a7f4b; border-radius: 0 6px 6px 0; }
+.legend { display: flex; flex-wrap: wrap; gap: 16px; margin: 0 0 22px; font-size: 12px; color: #556; }
+.legend .k { display: inline-flex; align-items: center; gap: 6px; }
+.legend .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+.legend .dot.m { background: #2f6fd0; }
+.legend .dot.r { background: #1a7f4b; }
+.legend .dot.x { background: #dbe3f0; border: 1px solid #b9c4d6; }
 h2 { color: #0b3b8f; font-size: 16px; margin: 22px 0 8px; border-bottom: 1px solid #d7deea; padding-bottom: 4px; }
 table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #d7deea; border-radius: 8px; overflow: hidden; font-size: 13px; }
 th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #eef1f6; }
@@ -26,9 +35,17 @@ tr:last-child td { border-bottom: none; }
 <div class="wrap">
   <h1>RECLAIM</h1>
   <p class="sub">Reconciliation-Enabled Closed-Loop AI for Integrity &amp; Money-recovery — run report</p>
-  <div class="cards"><div class="card "><div class="label">Total expected</div><div class="value">10132.00 INR</div></div><div class="card good"><div class="label">Matched</div><div class="value">6382.00 INR</div></div><div class="card good"><div class="label">Recovered</div><div class="value">200.00 INR</div></div><div class="card warn"><div class="label">Residual</div><div class="value">750.00 INR</div></div></div>
-  <div class="label" style="color:#6a768c;font-size:12px;">match rate 0.6299 (63.0% of expected)</div>
-  <div class="bar"><span style="width:63.0%"></span></div>
+  <div class="cards"><div class="card "><div class="label">Total expected</div><div class="value">10132.00 INR</div></div><div class="card good"><div class="label">Matched</div><div class="value">6382.00 INR</div></div><div class="card good"><div class="label">Recovered</div><div class="value">200.00 INR</div></div><div class="card hero"><div class="label">Closed</div><div class="value">6582.00 INR</div></div><div class="card warn"><div class="label">Residual</div><div class="value">750.00 INR</div></div></div>
+  <div class="label" style="color:#6a768c;font-size:12px;">detection 63.0% &rarr; <b style="color:#0b3b8f;">closure 65.0%</b> &nbsp;(match rate 0.6299 &rarr; closure rate 0.6496)</div>
+  <div class="bar">
+    <span class="seg-m" style="width:63.0%" title="reconciled 6382.00 INR"></span>
+    <span class="seg-r" style="width:2.0%" title="recovered 200.00 INR"></span>
+  </div>
+  <div class="legend">
+    <span class="k"><span class="dot m"></span>reconciled 6382.00 INR</span>
+    <span class="k"><span class="dot r"></span>recovered 200.00 INR</span>
+    <span class="k"><span class="dot x"></span>residual 750.00 INR</span>
+  </div>
 
   <h2>What happened</h2>
   <table>
@@ -44,7 +61,7 @@ tr:last-child td { border-bottom: none; }
 
   <h2>Integrity</h2>
   <p>double-entry ledger (INR): <span class="pill ok">balanced</span></p>
-  <p class="mono">audit root: 8b1bfada634e920dbf5e6b811d0ef89e82a17e5bab696478fdf95f3b9d6551b5</p>
+  <p class="mono">audit root: 396f405b746787e7ac858b8f53a081f4cdb944d446b813a75b258da2fa8c3b8a</p>
 
   <p class="foot">Deterministic engine. AI resolver and payment executor plug in behind tested interfaces.</p>
 </div>

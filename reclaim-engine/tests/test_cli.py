@@ -268,3 +268,117 @@ def test_cli_reports_pending_review(tmp_path, capsys):
     out = capsys.readouterr().out
     assert rc == 0
     assert "pending review" in out
+
+
+# --------------------------------------------------------------------------
+# Anchored replay — an unanchored replay cannot detect tampering, because a
+# gutted log recomputes a valid Merkle root of whatever survives.
+# --------------------------------------------------------------------------
+def _gut_audit_log(store, keep=2):
+    p = store / "audit.jsonl"
+    lines = p.read_text(encoding="utf-8").splitlines()
+    p.write_text("\n".join(lines[:keep]) + "\n", encoding="utf-8", newline="\n")
+
+
+def test_store_publishes_root_file(tmp_path, capsys):
+    store = tmp_path / "run"
+    assert main([str(SAMPLE), "--store", str(store)]) == 0
+    out = capsys.readouterr().out
+    published = (store / "root.txt").read_text(encoding="utf-8").strip()
+    assert len(published) == 64                      # full sha256 hex
+    assert published.startswith(out.split("audit root ")[1].split("...")[0])
+    assert "published:" in out
+
+
+def test_replay_auto_anchors_on_root_file(tmp_path, capsys):
+    store = tmp_path / "run"
+    main([str(SAMPLE), "--store", str(store)])
+    capsys.readouterr()
+    rc = main(["--replay", str(store)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "root.txt" in out                         # anchor line names the source
+    assert "root matches     : True" in out
+
+
+def test_replay_auto_anchor_catches_deleted_audit_events(tmp_path, capsys):
+    """The regression this anchoring exists for: deleting audit events used to
+    replay as VERIFIED because the log re-rooted itself."""
+    store = tmp_path / "run"
+    main([str(SAMPLE), "--store", str(store)])
+    capsys.readouterr()
+    _gut_audit_log(store)
+    rc = main(["--replay", str(store)])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "replay verification: FAILED" in out
+    assert "root matches     : False" in out
+    assert "audit events     : 2" in out             # proofs still pass on the gutted log...
+    assert "inclusion proofs : ok" in out            # ...which is exactly why an anchor is required
+
+
+def test_replay_refuses_when_unanchored(tmp_path, capsys):
+    store = tmp_path / "run"
+    main([str(SAMPLE), "--store", str(store)])
+    capsys.readouterr()
+    (store / "root.txt").unlink()                    # no published root, no key, no --expect-root
+    rc = main(["--replay", str(store)])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "UNANCHORED" in err
+
+
+def test_replay_refuses_on_empty_root_file(tmp_path, capsys):
+    store = tmp_path / "run"
+    main([str(SAMPLE), "--store", str(store)])
+    capsys.readouterr()
+    (store / "root.txt").write_text("   \n", encoding="utf-8")
+    rc = main(["--replay", str(store)])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "is empty" in err
+
+
+def test_explicit_expect_root_overrides_root_file(tmp_path, capsys):
+    store = tmp_path / "run"
+    main([str(SAMPLE), "--store", str(store)])
+    capsys.readouterr()
+    rc = main(["--replay", str(store), "--expect-root", "00" * 32])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "anchor           : --expect-root" in out
+
+
+def test_key_file_alone_anchors_replay(tmp_path, capsys):
+    """A signature over the root is an anchor too — no root.txt needed."""
+    store, key = tmp_path / "run", tmp_path / "k.bin"
+    key.write_bytes(b"0" * 32)
+    main([str(SAMPLE), "--store", str(store), "--key-file", str(key)])
+    capsys.readouterr()
+    (store / "root.txt").unlink()
+    rc = main(["--replay", str(store), "--key-file", str(key)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "anchor           : --key-file signature" in out
+    assert "root matches" not in out                 # no published root to compare against
+    assert "signature        : VERIFIED" in out
+
+
+def test_key_file_alone_catches_deleted_audit_events(tmp_path, capsys):
+    store, key = tmp_path / "run", tmp_path / "k.bin"
+    key.write_bytes(b"0" * 32)
+    main([str(SAMPLE), "--store", str(store), "--key-file", str(key)])
+    capsys.readouterr()
+    (store / "root.txt").unlink()
+    _gut_audit_log(store)
+    rc = main(["--replay", str(store), "--key-file", str(key)])
+    assert rc == 1
+    assert "signature        : FAILED" in capsys.readouterr().out
+
+
+def test_cli_reports_closure_rate(capsys):
+    main([str(SAMPLE), "--json"])
+    data = json.loads(capsys.readouterr().out)
+    # CLI is detection-only: nothing recovered, so closure == match.
+    assert data["closed"] == data["matched"]
+    assert data["closure_rate"] == data["match_rate"]

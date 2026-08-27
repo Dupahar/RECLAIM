@@ -82,9 +82,30 @@ class RunReport:
         return total
 
     def match_rate(self) -> Decimal:
+        """Detection rate *before* recovery: reconciled payout / expected payout.
+
+        Deliberately excludes recovered money — this is the "how much tied out
+        on its own" number, the baseline the closure rate is measured against.
+        """
         if self.total_expected.is_zero:
             return Decimal("1").quantize(_Q)
         return (self.matched_amount.amount / self.total_expected.amount).quantize(_Q)
+
+    def closed_amount(self) -> Money:
+        """Money accounted for after the loop closes: reconciled + recovered."""
+        return self.matched_amount + self.recovered_amount
+
+    def closure_rate(self) -> Decimal:
+        """Closure rate *after* recovery: (reconciled + recovered) / expected.
+
+        This is the number the product claim is about — the loop is "closed"
+        for every rupee that either tied out or was won back. ``match_rate`` ->
+        ``closure_rate`` is the before/after pair; whatever remains is the
+        honest residual a human still owns.
+        """
+        if self.total_expected.is_zero:
+            return Decimal("1").quantize(_Q)
+        return (self.closed_amount().amount / self.total_expected.amount).quantize(_Q)
 
     @property
     def ai_confirmed_count(self) -> int:
@@ -101,6 +122,8 @@ class RunReport:
             "matched": str(self.matched_amount),
             "match_rate": str(self.match_rate()),
             "recovered": str(self.recovered_amount),
+            "closed": str(self.closed_amount()),
+            "closure_rate": str(self.closure_rate()),
             "residual": str(self.leaked_residual()),
             "residual_leaks": len(self.residual_leaks),
             "auto_matched": len(self.auto_matched),

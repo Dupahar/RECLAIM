@@ -62,3 +62,21 @@ def test_escapes_untrusted_hypothesis(tmp_path):
     # a leak hypothesis is rendered escaped (no raw HTML injection)
     html = render_report(_report())
     assert "<script>" not in html  # nothing injects raw tags
+
+
+def test_dashboard_shows_closure_story():
+    """The dashboard must show detection -> closure, not just detection."""
+    html_out = render_report(_report())
+    assert "CLOSED" in html_out.upper()
+    assert "closure" in html_out
+    # two-segment meter: reconciled slice + recovered slice, each labelled
+    assert 'class="seg-m"' in html_out and 'class="seg-r"' in html_out
+    assert "reconciled" in html_out and "recovered" in html_out
+
+
+def test_dashboard_meter_segments_never_exceed_the_track():
+    """Widths are clamped so a pathological report cannot overflow the bar."""
+    import re
+    html_out = render_report(_report())
+    widths = [float(w) for w in re.findall(r'width:([0-9.]+)%', html_out)]
+    assert widths and sum(widths) <= 100.0

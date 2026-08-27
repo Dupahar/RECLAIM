@@ -269,6 +269,12 @@ sequenceDiagram
 
 ## 10. Worked Example — End to End
 
+> **This section is an illustrative target scenario, not measured output.** The figures below
+> (94% -> 99.2%, +38pt causal lift) describe the product we are building toward on a realistic
+> merchant cycle. They are **not** produced by the current engine and must never be quoted as
+> results. For what the code actually does today, and on which batch, see
+> [What the engine measures today](#what-the-engine-measures-today) at the end of this section.
+
 RECLAIM ingests a mid D2C brand's cycle: **240 orders (₹5,00,000)**, one Razorpay settlement file, one bank statement, plus **200 failed ₹499 subscription debits**.
 
 **Reconciliation output:**
@@ -289,7 +295,26 @@ RECLAIM ingests a mid D2C brand's cycle: **240 orders (₹5,00,000)**, one Razor
 **Closure:**
 > After write-back, **re-reconciled match rate rises to 99.2%**; residual = 2 human-queue exceptions + 23 exhausted recoveries. **Books provably closed to the rupee.**
 
-The demo ends on the three numbers — **94%→99.2% match · ₹63,700 causally recovered · a short honest residual** — and the two moments that read as judgment: *"I could not explain this ₹18 fee"* and *"I deliberately did not chase the 24 dead mandates."*
+The scenario ends on the three numbers — **94%→99.2% match · ₹63,700 causally recovered · a short honest residual** — and the two moments that read as judgment: *"I could not explain this ₹18 fee"* and *"I deliberately did not chase the 24 dead mandates."*
+
+### What the engine measures today
+
+On the shipped sample batch (`reclaim-engine/examples/sample_batch.json`, 4 settlements / 3 bank
+credits / ₹10,132 expected), `python -m reclaim.demo` reports:
+
+| Metric | Value | Real or simulated |
+|---|---|---|
+| Match rate (detection, before recovery) | **0.6299** — ₹6,382 of ₹10,132 | **Real** — deterministic matching |
+| Recovered | **₹200.00** | **Simulated** — deterministic stand-in executor, no payment rail |
+| Closure rate (after recovery) | **0.6496** — ₹6,582 closed | Real arithmetic over a simulated recovery |
+| Residual | **₹750.00**, 1 named leak | **Real** — the honest exception list |
+| Causal lift vs control | **not implemented** | No holdout, no measured uplift (Sprint 2) |
+
+`match_rate` and `closure_rate` are deliberately separate metrics so the before/after is visible
+rather than collapsed into one figure — see
+[ADR-0014](reclaim-engine/docs/decisions/ADR-0014-closure-rate.md). The ₹200 recovery is arithmetic
+over a *simulated* outcome: the recovery workflow (diagnosis, RBI 24h window, capped attempts,
+idempotency, stopping rules) is real and tested, but no notice is sent and no money moves.
 
 ---
 

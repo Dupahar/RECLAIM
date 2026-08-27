@@ -18,14 +18,23 @@ body { font-family: 'Segoe UI', Arial, sans-serif; margin: 0; background: #eef2f
 .wrap { max-width: 960px; margin: 0 auto; padding: 28px 20px 48px; }
 h1 { color: #0b3b8f; margin: 0 0 2px; letter-spacing: 2px; }
 .sub { color: #556; margin: 0 0 22px; }
-.cards { display: flex; flex-wrap: wrap; gap: 14px; margin-bottom: 22px; }
-.card { flex: 1 1 180px; background: #fff; border: 1px solid #d7deea; border-radius: 10px; padding: 16px 18px; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 14px; margin-bottom: 22px; }
+.card { background: #fff; border: 1px solid #d7deea; border-radius: 10px; padding: 16px 18px; }
 .card .label { font-size: 12px; text-transform: uppercase; letter-spacing: .5px; color: #6a768c; }
-.card .value { font-size: 26px; font-weight: 700; color: #0b3b8f; margin-top: 4px; }
+.card .value { font-size: 21px; font-weight: 700; color: #0b3b8f; margin-top: 4px; white-space: nowrap; }
 .card.good .value { color: #1a7f4b; }
 .card.warn .value { color: #b8531a; }
-.bar { height: 12px; background: #dbe3f0; border-radius: 6px; overflow: hidden; margin: 6px 0 22px; }
-.bar > span { display: block; height: 100%; background: linear-gradient(90deg,#0b3b8f,#2f6fd0); }
+.card.hero { border-color: #0b3b8f; box-shadow: inset 3px 0 0 #0b3b8f; }
+.bar { height: 12px; background: #dbe3f0; border-radius: 6px; overflow: hidden; margin: 6px 0 8px; display: flex; gap: 2px; }
+.bar > span { display: block; height: 100%; }
+.bar .seg-m { background: #2f6fd0; border-radius: 6px 0 0 6px; }
+.bar .seg-r { background: #1a7f4b; border-radius: 0 6px 6px 0; }
+.legend { display: flex; flex-wrap: wrap; gap: 16px; margin: 0 0 22px; font-size: 12px; color: #556; }
+.legend .k { display: inline-flex; align-items: center; gap: 6px; }
+.legend .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+.legend .dot.m { background: #2f6fd0; }
+.legend .dot.r { background: #1a7f4b; }
+.legend .dot.x { background: #dbe3f0; border: 1px solid #b9c4d6; }
 h2 { color: #0b3b8f; font-size: 16px; margin: 22px 0 8px; border-bottom: 1px solid #d7deea; padding-bottom: 4px; }
 table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #d7deea; border-radius: 8px; overflow: hidden; font-size: 13px; }
 th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #eef1f6; }
@@ -47,12 +56,16 @@ def _card(label: str, value: str, cls: str = "") -> str:
 def render_report(report: RunReport, *, title: str = "RECLAIM", audit_root: str | None = None) -> str:
     s = report.summary()
     rate_pct = float(report.match_rate()) * 100
+    closure_pct = float(report.closure_rate()) * 100
+    # the recovered slice of the meter, clamped so the two segments never exceed the track
+    recovered_pct = max(0.0, min(closure_pct, 100.0) - min(rate_pct, 100.0))
     balanced = report.ledger.is_globally_balanced(report.currency)
 
     cards = "".join([
         _card("Total expected", s["total_expected"]),
         _card("Matched", s["matched"], "good"),
         _card("Recovered", s["recovered"], "good"),
+        _card("Closed", s["closed"], "hero"),
         _card("Residual", s["residual"], "warn"),
     ])
 
@@ -72,8 +85,16 @@ def render_report(report: RunReport, *, title: str = "RECLAIM", audit_root: str 
   <h1>{html.escape(title)}</h1>
   <p class="sub">Reconciliation-Enabled Closed-Loop AI for Integrity &amp; Money-recovery — run report</p>
   <div class="cards">{cards}</div>
-  <div class="label" style="color:#6a768c;font-size:12px;">match rate {s['match_rate']} ({rate_pct:.1f}% of expected)</div>
-  <div class="bar"><span style="width:{min(rate_pct,100):.1f}%"></span></div>
+  <div class="label" style="color:#6a768c;font-size:12px;">detection {rate_pct:.1f}% &rarr; <b style="color:#0b3b8f;">closure {closure_pct:.1f}%</b> &nbsp;(match rate {s['match_rate']} &rarr; closure rate {s['closure_rate']})</div>
+  <div class="bar">
+    <span class="seg-m" style="width:{min(rate_pct,100):.1f}%" title="reconciled {html.escape(s['matched'])}"></span>
+    <span class="seg-r" style="width:{recovered_pct:.1f}%" title="recovered {html.escape(s['recovered'])}"></span>
+  </div>
+  <div class="legend">
+    <span class="k"><span class="dot m"></span>reconciled {html.escape(s['matched'])}</span>
+    <span class="k"><span class="dot r"></span>recovered {html.escape(s['recovered'])}</span>
+    <span class="k"><span class="dot x"></span>residual {html.escape(s['residual'])}</span>
+  </div>
 
   <h2>What happened</h2>
   <table>
@@ -102,5 +123,5 @@ def render_report(report: RunReport, *, title: str = "RECLAIM", audit_root: str 
 def write_dashboard(report: RunReport, path, *, title: str = "RECLAIM",
                     audit_root: str | None = None) -> pathlib.Path:
     p = pathlib.Path(path)
-    p.write_text(render_report(report, title=title, audit_root=audit_root), encoding="utf-8")
+    p.write_text(render_report(report, title=title, audit_root=audit_root), encoding="utf-8", newline="\n")
     return p

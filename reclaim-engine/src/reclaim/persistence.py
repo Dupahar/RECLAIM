@@ -61,7 +61,7 @@ class JsonlFileStore:
 
     def append(self, record: dict) -> None:
         line = json.dumps(record, separators=(",", ":"), sort_keys=True)
-        with self._path.open("a", encoding="utf-8") as fh:
+        with self._path.open("a", encoding="utf-8", newline="\n") as fh:
             fh.write(line + "\n")
 
     def read(self) -> list[dict]:
@@ -142,14 +142,45 @@ def event_from_record(d, where: str = "event") -> AuditEvent:
 # --------------------------------------------------------------------------
 # Repositories
 # --------------------------------------------------------------------------
-class LedgerRepository:
-    """Persists postings and rehydrates a Ledger with identical balances."""
+def _canonical(record: dict) -> str:
+    """Canonical text form of a record — the dedupe key. Matches the on-disk
+    form written by ``JsonlFileStore.append``."""
+    return json.dumps(record, separators=(",", ":"), sort_keys=True)
+
+
+class _DedupingRepository:
+    """Shared base: append a record only if that exact record is not already
+    stored. This makes persisting the *same* run twice a no-op, so a re-run
+    cannot silently change the rehydrated state or the Merkle root — the same
+    idempotency rule ``Ledger.post`` already applies in memory.
+
+    The set of stored records is snapshotted on first write and kept current as
+    this repository appends, so a persist costs one store read, not one per
+    record.
+    """
 
     def __init__(self, store: EventStore) -> None:
         self._store = store
+        self._seen = None
+
+    def _append_once(self, record: dict) -> bool:
+        """Append unless already present. Returns True if it was written."""
+        if self._seen is None:
+            self._seen = {_canonical(r) for r in self._store.read()}
+        key = _canonical(record)
+        if key in self._seen:
+            return False
+        self._seen.add(key)
+        self._store.append(record)
+        return True
+
+
+class LedgerRepository(_DedupingRepository):
+    """Persists postings and rehydrates a Ledger with identical balances.
+    Idempotent by content: re-saving an identical posting is a no-op."""
 
     def save_posting(self, posting: Posting) -> None:
-        self._store.append(posting_to_record(posting))
+        self._append_once(posting_to_record(posting))
 
     def load(self) -> Ledger:
         ledger = Ledger()
@@ -158,14 +189,13 @@ class LedgerRepository:
         return ledger
 
 
-class AuditRepository:
-    """Persists audit events and rehydrates a MerkleAuditLog with identical root."""
-
-    def __init__(self, store: EventStore) -> None:
-        self._store = store
+class AuditRepository(_DedupingRepository):
+    """Persists audit events and rehydrates a MerkleAuditLog with identical root.
+    Idempotent by content: re-appending an identical event is a no-op, so
+    persisting a run twice leaves the root unchanged."""
 
     def append_event(self, event: AuditEvent) -> None:
-        self._store.append(event_to_record(event))
+        self._append_once(event_to_record(event))
 
     def load(self) -> MerkleAuditLog:
         log = MerkleAuditLog()

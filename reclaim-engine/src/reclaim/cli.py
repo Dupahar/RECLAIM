@@ -23,12 +23,16 @@ from .signing import SigningError, signed_root_record, verify_signed_record
 from .verification import VerificationResult, verify_stores
 
 
+ROOT_FILE = "root.txt"
+
+
 def _print_human(rep) -> None:
     s = rep.summary()
     print("RECLAIM report")
     print(f"  total expected : {s['total_expected']}")
-    print(f"  matched        : {s['matched']}   (rate {s['match_rate']})")
+    print(f"  matched        : {s['matched']}   (match rate {s['match_rate']})")
     print(f"  recovered      : {s['recovered']}")
+    print(f"  closed         : {s['closed']}   (closure rate {s['closure_rate']})")
     print(f"  residual       : {s['residual']}  ({s['residual_leaks']} leak/s)")
     print(f"  auto-matched   : {s['auto_matched']}   pending review : {s['pending_review']}")
     if rep.residual_leaks:
@@ -51,9 +55,10 @@ def _run_stamp(settlements, banks) -> datetime | None:
     return None
 
 
-def _print_verify(res: VerificationResult, source) -> None:
+def _print_verify(res: VerificationResult, source, anchor: str) -> None:
     print(f"replay verification: {'VERIFIED' if res.ok else 'FAILED'}")
     print(f"  source           : {source}")
+    print(f"  anchor           : {anchor}")
     print(f"  postings         : {res.posting_count}")
     print(f"  ledger balanced  : {res.ledger_balanced} ({','.join(res.currencies) or '-'})")
     print(f"  audit events     : {res.audit_events}")
@@ -75,12 +80,43 @@ def _load_key(key_file):
     return key
 
 
+def _resolve_anchor(d: pathlib.Path, expect_root, key):
+    """Pick the trust anchor for a replay, or explain why there isn't one.
+
+    An *unanchored* replay proves only self-consistency: delete or edit stored
+    events and the log simply recomputes a valid Merkle root of whatever is
+    left, with valid inclusion proofs. Detecting tampering requires comparing
+    against something recorded outside the log's own contents -- a published
+    root (``--expect-root`` / ``root.txt``) or an HMAC signature over it
+    (``--key-file``). Returns ``(expect_root, anchor_label, error_or_None)``.
+    """
+    if expect_root is not None:
+        return expect_root, "--expect-root", None
+    root_file = d / ROOT_FILE
+    if root_file.exists():
+        published = root_file.read_text(encoding="utf-8").strip()
+        if published == "":
+            return None, None, f"{root_file} is empty (no published root to check against)"
+        return published, str(root_file), None
+    if key is not None:
+        return None, "--key-file signature", None
+    return None, None, (
+        f"UNANCHORED replay - tampering cannot be detected.\n"
+        f"  no {root_file}, no --expect-root, no --key-file.\n"
+        f"  a modified log recomputes a valid root of itself; supply an anchor."
+    )
+
+
 def _do_replay(replay_dir: str, expect_root, key) -> int:
     d = pathlib.Path(replay_dir)
     ledger_file, audit_file = d / "ledger.jsonl", d / "audit.jsonl"
     if not ledger_file.exists() and not audit_file.exists():
         print(f"error: no stored run found at {d} (expected ledger.jsonl / audit.jsonl)",
               file=sys.stderr)
+        return 2
+    expect_root, anchor, err = _resolve_anchor(d, expect_root, key)
+    if err is not None:
+        print(f"error: {err}", file=sys.stderr)
         return 2
     try:
         res = verify_stores(JsonlFileStore(ledger_file), JsonlFileStore(audit_file),
@@ -89,7 +125,7 @@ def _do_replay(replay_dir: str, expect_root, key) -> int:
         print("replay verification: FAILED", file=sys.stderr)
         print(f"  error: {exc}", file=sys.stderr)
         return 1
-    _print_verify(res, d)
+    _print_verify(res, d, anchor)
 
     sig_ok = True
     if key is not None:
@@ -162,6 +198,10 @@ def main(argv=None) -> int:
                             JsonlFileStore(store_dir / "audit.jsonl"))
         print(f"persisted: {len(rep.ledger.postings())} postings, {audit.size} audit events "
               f"-> {store_dir}  (audit root {audit.root()[:16]}...)")
+        # Publish the root next to the run so a later --replay is anchored by
+        # default. Keep it somewhere tamper-visible (VCS, a ticket) too.
+        (store_dir / ROOT_FILE).write_text(audit.root() + "\n", encoding="utf-8", newline="\n")
+        print(f"published: {store_dir / ROOT_FILE} (anchors --replay)")
         if key is not None:
             record = signed_root_record(audit.root(), key)
             (store_dir / "audit.sig").write_text(json.dumps(record), encoding="utf-8")

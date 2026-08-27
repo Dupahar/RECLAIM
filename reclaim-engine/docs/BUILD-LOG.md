@@ -366,3 +366,87 @@ Next candidate layers: durable/event-sourced persistence; Merkle transparency au
 **Result:** ✅ Full suite: **322 passed, 100% line + branch coverage** (1517 statements, 374 branches, 0 partial) across all eighteen modules.
 
 ---
+
+## 2026-08-28 — Maintenance: reproducible demo artifacts + cross-platform determinism
+
+**What:** Three fixes plus a runbook, found by re-running the whole project end to end.
+1. `docs/RUNBOOK.md` — a one-page reproducible demo: exact commands, verbatim expected output, the sample data explained row by row, tamper-detection walkthrough, exit-code table. Documents the `PYTHONPATH=src` / `pip install -e .` step that `python -m reclaim` needs and that both READMEs previously omitted.
+2. **`examples/demo_dashboard.html` was not reproducible.** Its audit root was `8b1bfada…`, but regenerating from the code yields `396f405b…`. Cause: the shipped artifact was stamped with the build date (`2026-08-26T09:00`) instead of the batch's own deterministic `TS` (`2026-08-25T09:00`) — the same off-by-one-day that the JSON/CSV sample files hit earlier. Regenerated both the HTML and the PNG from `TS`.
+3. **Generated files used platform-dependent line endings.** `dashboard.write_dashboard` and `persistence.JsonlFileStore.append` opened files in text mode without `newline=`, so Python emitted CRLF on Windows and LF on POSIX for byte-identical runs. Fixed both to `newline="\n"`.
+
+**Why:** The repo's headline claim is that runs are deterministic and replayable — "same inputs produce the same audit root". A flagship artifact nobody could regenerate contradicted that, and store files whose bytes depend on the OS weaken an append-only tamper-evident log (the Merkle root was never affected — it is computed over record content, not file bytes — so this was a reproducibility defect, not a correctness one).
+
+**How tested:** Full suite re-run: **322 passed, 100% line + branch** (1517 statements, 374 branches, 0 partial). Every RUNBOOK step scripted and asserted on exit code and output: demo, JSON, CSV, JSON≡CSV byte-equality, `--store` root `2e01c7d0…`, `--replay --expect-root` (exit 0), tampered ledger (exit 1), wrong root (exit 1), usage error (exit 2). Dashboard regeneration confirmed byte-identical on repeat runs and now writes pure LF (0 CRLF). Store files verified LF-only; `--replay` still verifies with the audit root unchanged at `2e01c7d0…`. Verified `pip install -e ".[dev]"` in a clean venv: `python -m reclaim` and the suite both run with no `PYTHONPATH`. Both README mermaid diagrams rendered with mermaid-cli to confirm they parse.
+
+**Result:** ✅ Demo artifacts are now reproducible from source on any platform; docs match the code.
+
+**Open items:** `domain._validate_confidence` accepts `int`/`float` and **rejects `Decimal`**, while `resolver.Assessment` requires `Decimal` and rejects `float` — the two confidence validators are exactly inverted. Not a live bug: no engine path populates `Transaction.match_confidence` or `LeakRecord.confidence` (only tests do), so the fields are unused API surface. It is a trap for whoever first threads the probabilistic matcher's `Decimal` score into `match_confidence`. Decide: converge on `Decimal` everywhere, or drop the two unused fields.
+
+---
+
+## 2026-08-28 — Post-Sprint-1 adversarial review: three integrity fixes
+
+**What:** An adversarial read of the finished engine found three defects that all share one shape —
+**the system reporting success it had not earned.** All three are fixed, each with an ADR and a
+regression test that fails on the old behaviour.
+
+1. **No closure number existed.** `match_rate` = `matched / total_expected`, and `matched` summed
+   reconciled settlements only. The demo recovered ₹200 and the reported rate did not move — for a
+   product whose thesis is "close the loop and prove it", nothing in the output changed when the
+   loop closed. Added `closed_amount()` and `closure_rate()` **alongside** `match_rate` rather than
+   redefining it, so the before/after pair stays visible: detection `0.6299` → closure `0.6496`.
+   Surfaced in `summary()`, the CLI, `reclaim.demo`, and the dashboard. ADR-0014.
+2. **Unanchored replay reported VERIFIED on a gutted audit log.** `verify_stores()` recomputes the
+   Merkle root from the stored events and checks inclusion proofs against *that* root — a
+   self-referential check. Deleting 2 of 4 audit events and replaying printed `VERIFIED`,
+   `inclusion proofs: ok`, **exit 0**. `--store` now publishes `root.txt`; `--replay` resolves an
+   anchor (`--expect-root` → `root.txt` → `--key-file` signature) and **refuses with exit 2** when
+   there is none, instead of issuing a verdict it cannot justify. The output names its anchor.
+   ADR-0015.
+3. **Persisting a run twice was not idempotent.** `AuditRepository.append_event` appended
+   unconditionally, so a second `persist_run()` doubled the events (4 → 8) and changed the reloaded
+   root — a legitimate re-run became indistinguishable from tampering. Both repositories now share
+   the content-idempotency rule `Ledger.post` already had. ADR-0016.
+
+Two further review findings were **documentation** problems, not code defects, and are fixed as
+such: the RBI 24-hour notice is *modelled* (time recorded, attempts scheduled after it) but never
+sent — there is no notice executor; and demo recovery outcomes come from `AlwaysSucceedsExecutor`
+with no control group or causal uplift. Both are now stated plainly in an honest-limits table in
+the README and the RUNBOOK, and the product document's worked example is labelled an illustrative
+target scenario with the engine's actual measured numbers beside it.
+
+**Why:** A verifier that passes on tampered data is worse than no verifier — it converts absence of
+evidence into a green tick, and a scripted CI check would never notice. A closure engine that
+cannot show closure has no output for its own thesis. And an honest limit stated late reads as a
+concession; stated first, it reads as rigour.
+
+**How tested:** 14 new tests. `test_cli.py` — root.txt publication, auto-anchoring, the deleted-events
+regression (asserts the gutted log still self-verifies, which is *why* the anchor is required),
+unanchored refusal, empty root.txt, explicit override, key-only anchoring both clean and tampered,
+closure in the JSON summary. `test_persistence.py` — audit/ledger append idempotency, dedupe against
+a pre-existing store, distinct events preserved. `test_persist_run.py` — double persist leaves files,
+event count and root unchanged and replay still verifies. `test_dashboard.py` — closure story
+rendered, meter segments clamped. Full suite re-run: **338 passed, 100% line + branch** (1557
+statements, 390 branches, 0 partial). Every RUNBOOK step re-verified end to end against the new
+behaviour, including all three tamper modes and the idempotent re-persist.
+
+**Result:** ✅ Detection→closure is now visible in every output; a replay either proves something or
+refuses; a re-run can never masquerade as tampering. 19 modules, 338 tests, ADRs 0001-0016.
+
+**Open items:**
+- `domain._validate_confidence` accepts `int`/`float` and **rejects `Decimal`**, while
+  `resolver.Assessment` requires `Decimal` and rejects `float` — inverted validators. Not a live bug
+  (no engine path populates `Transaction.match_confidence` or `LeakRecord.confidence`), but a trap
+  for whoever first threads the probabilistic `Decimal` score into it. Converge on `Decimal` or drop
+  the two unused fields.
+- The 24-hour notice has no executor. If it should be an *action* rather than a recorded time, it
+  needs a `NoticeExecutor` seam mirroring `RecoveryExecutor` — new module, tests, ADR.
+- No causal measurement. Control-group assignment and uplift are Sprint 2 and are currently claimed
+  nowhere.
+- **Environment hazard (not a repo defect):** a global editable install at
+  `site-packages/__editable__.reclaim_engine-0.0.1.pth` points at a *different* checkout
+  (`Downloads/Razorpay_Testing/RECLAIM/reclaim-engine/src`). `pytest` is unaffected (`pyproject.toml`
+  sets `pythonpath = ["src"]`, which wins), but a bare `import reclaim` from a directory without
+  `src` on the path silently loads the other copy. The RUNBOOK now includes a one-line check.
+
+---

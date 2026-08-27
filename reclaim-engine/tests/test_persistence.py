@@ -213,3 +213,44 @@ def test_inmemory_store_isolates_history():
     store.append(rec)
     rec["kind"] = "MUTATED"          # mutate the caller's dict after append
     assert store.read()[0]["kind"] == "x"   # stored copy is unaffected
+
+
+# --------------------------------------------------------------------------
+# Run-level idempotency — persisting the same run twice must be a no-op, or a
+# legitimate re-persist would change the root and look exactly like tampering.
+# --------------------------------------------------------------------------
+def test_audit_repository_append_is_idempotent():
+    store = InMemoryStore()
+    repo = AuditRepository(store)
+    event = AuditEvent("exact_match", TS, {"settlement": "s1", "bank": "b1"})
+    repo.append_event(event)
+    repo.append_event(event)                      # identical -> dropped
+    assert len(store.read()) == 1
+    assert repo.load().size == 1
+
+
+def test_audit_repository_dedupes_against_pre_existing_store():
+    """A fresh repository over a store that already holds the event also skips."""
+    store = InMemoryStore()
+    event = AuditEvent("residual_leak", TS, {"leak": "L1"})
+    AuditRepository(store).append_event(event)
+    AuditRepository(store).append_event(event)    # new instance, same content
+    assert len(store.read()) == 1
+
+
+def test_audit_repository_keeps_distinct_events():
+    store = InMemoryStore()
+    repo = AuditRepository(store)
+    repo.append_event(AuditEvent("residual_leak", TS, {"leak": "L1"}))
+    repo.append_event(AuditEvent("residual_leak", TS, {"leak": "L2"}))
+    assert len(store.read()) == 2
+    assert repo.load().size == 2
+
+
+def test_ledger_repository_save_is_idempotent():
+    store = InMemoryStore()
+    repo = LedgerRepository(store)
+    repo.save_posting(posting())
+    repo.save_posting(posting())
+    assert len(store.read()) == 1
+    assert len(repo.load().postings()) == 1

@@ -5,9 +5,11 @@ from decimal import Decimal
 from reclaim.money import Money
 from reclaim.domain import Source, Transaction, TransactionRefs
 from reclaim.pipeline import persist_run, run_reclaim
+from reclaim.verification import verify_stores
 from reclaim.persistence import (
     AuditRepository,
     InMemoryStore,
+    JsonlFileStore,
     LedgerRepository,
 )
 from reclaim.resolver import GatedResolver, StaticResolver
@@ -74,3 +76,26 @@ def test_persist_run_writes_expected_counts():
     assert len(ledger_store.read()) == len(rep.ledger.postings())
     # audit events cover matches + recoveries + residual leaks
     assert len(audit_store.read()) >= 1
+
+
+def test_persist_run_twice_is_a_no_op(tmp_path):
+    """A re-persist must not change the stored root — otherwise a legitimate
+    double-run is indistinguishable from tampering on replay."""
+    ledger_file, audit_file = tmp_path / "ledger.jsonl", tmp_path / "audit.jsonl"
+    ls, aus = JsonlFileStore(ledger_file), JsonlFileStore(audit_file)
+    report = _run()
+
+    first = persist_run(report, TS, ls, aus)
+    lines_after_one = (audit_file.read_text(encoding="utf-8").splitlines(),
+                       ledger_file.read_text(encoding="utf-8").splitlines())
+
+    second = persist_run(report, TS, JsonlFileStore(ledger_file), JsonlFileStore(audit_file))
+    lines_after_two = (audit_file.read_text(encoding="utf-8").splitlines(),
+                       ledger_file.read_text(encoding="utf-8").splitlines())
+
+    assert lines_after_one == lines_after_two          # nothing appended twice
+    assert first.root() == second.root()
+
+    res = verify_stores(JsonlFileStore(ledger_file), JsonlFileStore(audit_file),
+                        expect_root=first.root())
+    assert res.ok and res.audit_root == first.root()
