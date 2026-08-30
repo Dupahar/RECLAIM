@@ -683,3 +683,87 @@ python -m reclaim --queue ./run --decide gate:value:leak:short:s5 \
 - Cross-run contact caps and consent state remain unimplemented.
 
 ---
+
+## 2026-08-31 — Sprint 3, Phase 26: the recovery ML layer (uplift + funded moment)
+
+**What:** `src/reclaim/uplift.py` and `src/reclaim/timing.py`, wired into the
+loop via an optional `Targeting` on `run_reclaim` and an `AttemptScheduler` seam
+on `RecoveryEngine`. Layer 5 chased every recoverable leak on a fixed schedule;
+both halves of that are now decisions rather than defaults.
+
+**Uplift — who to chase.** A T-learner over discrete cells
+(`failure reason × amount band × recency × prior failures`). Chasing a *sure
+thing* inflates gross recovery while adding nothing — exactly the number ADR-0022
+exists to stop us reporting — and chasing a *sleeping dog* destroys value while
+looking like activity. A response model cannot tell the four segments apart
+because three of them contain recoveries; only the difference between arms can.
+
+- Trained on **observed** outcomes (the Phase 24 verdict), never the executor's
+  claim. Training on claims would teach the model that whatever the executor
+  reports success for is persuadable, which is not a fact about customers.
+- Hierarchical fallback: cell → failure-reason pool → global →
+  `INSUFFICIENT_EVIDENCE`, with the answering level named. Support required in
+  *both* arms. This answers the architecture's own open question about
+  small-merchant calibration in code.
+- Classification order is deliberate: sleeping dogs first, so a harmed segment is
+  never downgraded to merely unprofitable.
+- `UnknownPolicy` defaults to CHASE. A model quietly shrinking coverage on thin
+  evidence loses a merchant money they were owed.
+- `skipped_leaks` carries every skip *with its reason* and `skipped_amount()`
+  totals the value left on the table. A targeting layer that hides that number is
+  unauditable — and a skipped leak stays on the honest residual list.
+- The holdout is decided **before** targeting, so a control unit targeting would
+  also have skipped still counts as held out; otherwise the experiment stops
+  measuring the policy that was deployed.
+
+**Funded moment — when to chase.** A concentration model over day-of-month and
+hour: take the mode, report how concentrated the history was as the confidence.
+Explains itself in one sentence ("you get paid on the 2nd") and needs a dozen
+observations, not a billion. Diffuse history produces a low confidence and a note
+recommending the fixed schedule.
+
+The load-bearing decision is that the scheduler is **advisory**. The engine hands
+it the notice deadline and anything returned at or before that deadline halts the
+recovery rather than being obeyed. A timing model that could shorten the RBI
+notice window would be a compliance bug wearing an ML hat, so the refusal lives
+in the engine, not in the model's good behaviour. Only the first attempt moves;
+later attempts space from wherever it landed, so a re-timed sequence does not
+bunch three attempts into a day.
+
+ADR-0024, ADR-0025.
+
+**How tested:** 76 new tests; full suite **606 passed, 100% line + branch**
+(2934 statements, 866 branches, 0 partial) across 29 modules. The ones carrying
+the argument: `test_a_sure_thing_is_not_chased_despite_a_high_treated_rate`
+(90% recover when chased, 85% when left alone — a response model ranks this top,
+uplift declines), `test_a_sleeping_dog_outranks_a_sure_thing_label`,
+`test_a_real_but_tiny_uplift_is_not_rounded_up_to_persuadable`,
+`test_a_one_armed_cell_never_produces_an_uplift`,
+`test_a_scheduler_cannot_shorten_the_notice_window` (three illegal proposals,
+all halted with zero attempts), `test_a_retimed_attempt_never_lands_inside_the_
+notice_window` (28 deadlines swept), `test_the_mode_wins_not_the_average` (the
+average of the 1st and the 29th is the 15th, when the account is empty on the
+15th), and `test_the_control_arm_is_decided_before_targeting`.
+
+**Dead code removed by the discipline (honest note):** `CellStats.merge` was
+written, then found to have no caller — the pooling in `fit` accumulates with
+`plus` directly. Deleted rather than kept alive by a test that existed only to
+cover it, the same lesson as the Phase 3 unreachable guard.
+
+**Open items / honest notes:**
+- **Nothing sources funded moments.** The predictor is fitted from a
+  caller-supplied history; the per-customer credit events that would populate it
+  are not associated with a customer identity anywhere in the domain. Seam and
+  model are real and tested; the feed is not built.
+- `Context.prior_failures` is likewise unsourced — required rather than defaulted
+  so the gap is visible at every call site instead of silently reading zero.
+- **No propensity logging and no offline policy evaluation**, so a *new*
+  targeting policy cannot yet be validated against logged data before it ships.
+  That is the bandit's prerequisite and belongs with it.
+- Nothing retrains automatically, which is the right default for a model that
+  decides whether to debit someone.
+- The models are not yet *demonstrated* end to end — a learn-then-target second
+  cycle is the next piece of work, and until it exists this phase is "built but
+  not shown", which is the same criticism Sprint 2 earned for measurement.
+
+---

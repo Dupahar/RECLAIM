@@ -230,3 +230,73 @@ def test_afa_limit_validation():
         RecoveryConfig(afa_limit="15000")
     with pytest.raises(RecoveryError):
         RecoveryConfig(afa_limit=Money.of("0", "INR"))
+
+
+# --------------------------------------------------------------------------
+# Phase 26 — the attempt scheduler seam (funded-moment re-timing)
+# --------------------------------------------------------------------------
+def test_the_first_attempt_can_be_retimed_and_later_ones_follow_it():
+    """A re-timed sequence keeps its spacing rather than bunching back against
+    the original fixed schedule."""
+    predicted = BASE + timedelta(hours=24 + 96)          # 4 days past the deadline
+    engine = RecoveryEngine(AlwaysFailsExecutor(),
+                            RecoveryConfig(max_attempts=3, gap_hours=24),
+                            scheduler=lambda l, deadline, fallback: predicted)
+    out = engine.recover(leak("500.00"), FailureReason.INSUFFICIENT_FUNDS, BASE)
+    assert [a.at_time for a in out.attempts] == [
+        predicted, predicted + timedelta(hours=24), predicted + timedelta(hours=48)]
+
+
+def test_a_retimed_success_says_so_in_its_rationale():
+    predicted = BASE + timedelta(hours=48)
+    engine = RecoveryEngine(AlwaysSucceedsExecutor(),
+                            scheduler=lambda l, deadline, fallback: predicted)
+    out = engine.recover(leak("500.00"), FailureReason.INSUFFICIENT_FUNDS, BASE)
+    assert out.final_state is RecoveryState.RECOVERED
+    assert "re-timed to 2026-08-27T09:00:00" in out.rationale
+
+
+def test_a_scheduler_cannot_shorten_the_notice_window():
+    """The compliance floor is not the timing model's to overrule. An answer at
+    or before the deadline halts rather than being obeyed."""
+    for proposed in (BASE, BASE + timedelta(hours=1), BASE + timedelta(hours=24)):
+        engine = RecoveryEngine(AlwaysSucceedsExecutor(),
+                                scheduler=lambda l, d, f, p=proposed: p)
+        out = engine.recover(leak("500.00"), FailureReason.INSUFFICIENT_FUNDS, BASE)
+        assert out.final_state is RecoveryState.HALTED
+        assert out.attempts == ()
+        assert "cannot shorten the notice window" in out.rationale
+
+
+def test_a_scheduler_returning_nonsense_halts_rather_than_crashing():
+    engine = RecoveryEngine(AlwaysSucceedsExecutor(),
+                            scheduler=lambda l, d, f: "tomorrow-ish")
+    out = engine.recover(leak("500.00"), FailureReason.INSUFFICIENT_FUNDS, BASE)
+    assert out.final_state is RecoveryState.HALTED
+    assert "non-datetime" in out.rationale
+
+
+def test_without_a_scheduler_the_fixed_schedule_is_unchanged():
+    """Regression guard: the seam must be invisible when unused."""
+    out = RecoveryEngine(AlwaysFailsExecutor(), RecoveryConfig(max_attempts=2)).recover(
+        leak("500.00"), FailureReason.INSUFFICIENT_FUNDS, BASE)
+    assert [a.at_time for a in out.attempts] == [BASE + timedelta(hours=24),
+                                                 BASE + timedelta(hours=48)]
+
+
+def test_the_real_timing_module_drops_into_the_seam():
+    """End to end with the actual predictor rather than a lambda."""
+    from reclaim.timing import FundedMoment, fit as fit_timing, schedule_attempt
+
+    history = [FundedMoment(customer_id="cust-1", at=datetime(2025, m, 2, 10))
+               for m in range(1, 13)]
+    predictor = fit_timing(history)
+    engine = RecoveryEngine(
+        AlwaysSucceedsExecutor(),
+        scheduler=lambda l, deadline, fallback: schedule_attempt(
+            predictor, "cust-1", notice_deadline=deadline, fallback=fallback).at)
+    out = engine.recover(leak("500.00"), FailureReason.INSUFFICIENT_FUNDS, BASE)
+    assert out.final_state is RecoveryState.RECOVERED
+    # notice deadline is 2026-08-26T09:00; the next predicted funded moment is
+    # the 2nd of September at 10:00
+    assert out.attempts[0].at_time == datetime(2026, 9, 2, 10, 0, 0)

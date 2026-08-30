@@ -128,6 +128,27 @@ class RecoveryExecutor(Protocol):
         ...
 
 
+@runtime_checkable
+class AttemptScheduler(Protocol):
+    """The seam that decides *when* the first attempt happens.
+
+    A fixed schedule (notice + 24h, then every ``gap_hours``) is indifferent to
+    whether there is money in the account at that moment, which is the only fact
+    that decides whether a debit succeeds. A scheduler may move the first
+    attempt to a predicted funded moment; ``timing.schedule_attempt`` is the
+    reference implementation.
+
+    The scheduler is advisory, not trusted: it receives the compliance deadline
+    and the engine's own fallback, and anything it returns at or before the
+    deadline halts the recovery rather than being obeyed. A timing model is not
+    allowed to shorten the RBI notice window.
+    """
+
+    def __call__(self, leak: LeakRecord, notice_deadline: datetime,
+                 fallback: datetime) -> datetime:  # pragma: no cover - protocol
+        ...
+
+
 @dataclass(frozen=True)
 class RecoveryAttempt:
     sequence: int
@@ -152,10 +173,12 @@ class RecoveryEngine:
     """Runs a bounded, compliant recovery workflow for one leak."""
 
     def __init__(self, executor: RecoveryExecutor, config: RecoveryConfig = DEFAULT_CONFIG,
-                 notice_executor: "Optional[NoticeExecutor]" = None) -> None:
+                 notice_executor: "Optional[NoticeExecutor]" = None,
+                 scheduler: "Optional[AttemptScheduler]" = None) -> None:
         self._executor = executor
         self._config = config
         self._notice_executor = notice_executor
+        self._scheduler = scheduler
 
     def recover(self, leak: LeakRecord, reason: FailureReason, base_time: datetime) -> RecoveryOutcome:
         if not isinstance(base_time, datetime):
@@ -199,9 +222,31 @@ class RecoveryEngine:
                                        "pre-debit notice was rejected; halted for human "
                                        "(no debit without notice)", notice_at)
 
+        # The first attempt may be re-timed to a predicted funded moment; later
+        # attempts space from wherever the first landed, so a re-timed sequence
+        # keeps its spacing instead of bunching against the original schedule.
+        deadline = base_time + timedelta(hours=cfg.notice_hours)
+        first_at = deadline
+        retimed_note = ""
+        if self._scheduler is not None:
+            proposed = self._scheduler(leak, deadline, deadline)
+            if not isinstance(proposed, datetime):
+                return RecoveryOutcome(leak, RecoveryState.HALTED, (), None,
+                                       "attempt scheduler returned a non-datetime; "
+                                       "halted for human", notice_at, notice_sent)
+            if proposed <= deadline:
+                return RecoveryOutcome(
+                    leak, RecoveryState.HALTED, (), None,
+                    f"attempt scheduler proposed {proposed.isoformat()}, at or before "
+                    f"the notice deadline {deadline.isoformat()}; refused and halted "
+                    "(a timing model cannot shorten the notice window)",
+                    notice_at, notice_sent)
+            first_at = proposed
+            retimed_note = f" (re-timed to {proposed.isoformat()})"
+
         attempts: list[RecoveryAttempt] = []
         for k in range(cfg.max_attempts):
-            at = base_time + timedelta(hours=cfg.notice_hours + k * cfg.gap_hours)
+            at = first_at + timedelta(hours=k * cfg.gap_hours)
             channel = cfg.channels[k % len(cfg.channels)]
             key = f"{leak.id}:attempt:{k}"
             try:
@@ -213,8 +258,9 @@ class RecoveryEngine:
             attempts.append(RecoveryAttempt(k, channel, at, key, result))
             if result is AttemptResult.SUCCEEDED:
                 return RecoveryOutcome(leak, RecoveryState.RECOVERED, tuple(attempts),
-                                       leak.amount, f"recovered on attempt {k + 1}", notice_at,
-                                       notice_sent)
+                                       leak.amount,
+                                       f"recovered on attempt {k + 1}{retimed_note}",
+                                       notice_at, notice_sent)
 
         return RecoveryOutcome(leak, RecoveryState.EXHAUSTED, tuple(attempts), None,
                                "all attempts failed; stopping rule reached", notice_at,

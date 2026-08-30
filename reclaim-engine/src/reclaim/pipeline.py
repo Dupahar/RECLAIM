@@ -31,6 +31,7 @@ from .probabilistic import DEFAULT_CONFIG as PROB_DEFAULT, MatchConfig, ScoredMa
 from .reconciliation import ReconciliationResult, reconcile_settlements_to_bank
 from .recovery import FailureReason, RecoveryEngine, RecoveryOutcome
 from .resolver import Decision, GatedResolver, ResolutionOutcome
+from .uplift import Selection, UnknownPolicy, UpliftModel, decide as uplift_decide
 
 _Q = Decimal("0.0001")
 
@@ -64,6 +65,37 @@ def _recovery_posting(leak: LeakRecord, amount: Money, ts: datetime) -> Posting:
 
 
 @dataclass(frozen=True)
+class Targeting:
+    """Uplift-based targeting for a run (architecture §7).
+
+    ``context_for`` maps a leak to an ``uplift.Context``. It is required rather
+    than defaulted because the features an uplift decision may use are a
+    modelling choice, and a silent default would let a caller train on one
+    feature set and predict on another.
+
+    ``unknown`` decides what happens where the model has no reliable estimate.
+    It defaults to CHASE — preserving today's behaviour — because a model
+    quietly shrinking recovery coverage on thin evidence costs a merchant money
+    they were owed.
+    """
+
+    model: UpliftModel
+    context_for: Callable[[LeakRecord], object]
+    unknown: UnknownPolicy = UnknownPolicy.CHASE
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.model, UpliftModel):
+            raise PipelineError("targeting.model must be an UpliftModel")
+        if not callable(self.context_for):
+            raise PipelineError("targeting.context_for must be callable")
+        if not isinstance(self.unknown, UnknownPolicy):
+            raise PipelineError("targeting.unknown must be an UnknownPolicy")
+
+    def decide(self, leak: LeakRecord) -> Selection:
+        return uplift_decide(self.model, self.context_for(leak), unknown=self.unknown)
+
+
+@dataclass(frozen=True)
 class RunReport:
     currency: str
     total_expected: Money
@@ -77,6 +109,17 @@ class RunReport:
     exact: ReconciliationResult
     ledger: Ledger
     control_leaks: tuple[LeakRecord, ...] = ()   # held out to measure lift (G9)
+    # Leaks uplift targeting chose not to chase, with the reason. Reported
+    # rather than dropped: skipping is money the engine decided to leave, and a
+    # targeting layer that hides that number is unauditable.
+    skipped_leaks: tuple[tuple[LeakRecord, str], ...] = ()
+
+    def skipped_amount(self) -> Money:
+        """Value targeting declined to chase — visible, never netted away."""
+        total = Money.zero(self.currency)
+        for leak, _reason in self.skipped_leaks:
+            total = total + leak.amount
+        return total
 
     def leaked_residual(self) -> Money:
         total = Money.zero(self.currency)
@@ -135,6 +178,8 @@ class RunReport:
             "pending_review": len(self.pending_review),
             "recovered_count": sum(1 for r in self.recoveries
                                    if r.final_state is RecoveryState.RECOVERED),
+            "targeting_skipped": len(self.skipped_leaks),
+            "targeting_skipped_amount": str(self.skipped_amount()),
         }
 
 
@@ -235,6 +280,7 @@ def run_reclaim(
     base_time: Optional[datetime] = None,
     prob_config: MatchConfig = PROB_DEFAULT,
     holdout: Optional[HoldoutPolicy] = None,
+    targeting: Optional[Targeting] = None,
 ) -> RunReport:
     """Run the full detect -> recover -> book loop over a batch."""
     if recovery_engine is not None and base_time is None:
@@ -280,14 +326,24 @@ def run_reclaim(
     recoveries: list[RecoveryOutcome] = []
     recovered_leak_ids: set[str] = set()
     control_leaks: list[LeakRecord] = []
+    skipped: list[tuple[LeakRecord, str]] = []
     if recovery_engine is not None:
         for leak in exact.leaks:
             if leak.recoverable:
                 if holdout is not None and holdout.arm(leak.id) is Arm.CONTROL:
                     # Deliberately not chased. This costs real money and is the
                     # only way to say later how much the chasing was worth (G9).
+                    # Checked *before* targeting so the control arm stays a clean
+                    # do-nothing baseline: a control unit that targeting would
+                    # also have skipped must still be counted as held out, or the
+                    # experiment stops measuring the policy it deployed.
                     control_leaks.append(leak)
                     continue
+                if targeting is not None:
+                    selection = targeting.decide(leak)
+                    if not selection.chase:
+                        skipped.append((leak, selection.reason))
+                        continue
                 out = recovery_engine.recover(leak, reason_for(leak), base_time)
                 recoveries.append(out)
                 if out.final_state is RecoveryState.RECOVERED:
@@ -332,4 +388,5 @@ def run_reclaim(
         exact=exact,
         ledger=ledger,
         control_leaks=tuple(control_leaks),
+        skipped_leaks=tuple(skipped),
     )

@@ -6,10 +6,15 @@ import pytest
 
 from reclaim.money import Money
 from reclaim.domain import Fees, RecoveryState, Source, Transaction, TransactionRefs
-from reclaim.pipeline import PipelineError, run_reclaim
+from reclaim.pipeline import PipelineError, Targeting, run_reclaim
 from reclaim.probabilistic import ScoredMatch  # noqa: F401 (documents the type in report)
 from reclaim.resolver import GatedResolver, StaticResolver
-from reclaim.recovery import AlwaysFailsExecutor, AlwaysSucceedsExecutor, RecoveryEngine
+from reclaim.recovery import (
+    AlwaysFailsExecutor,
+    AlwaysSucceedsExecutor,
+    FailureReason,
+    RecoveryEngine,
+)
 
 D = Decimal
 TS = datetime(2026, 8, 25, 9, 0, 0)
@@ -30,6 +35,11 @@ def s(sid, gross, utr, fees_total=None):
 def bnk(bid, amount, utr):
     return Transaction(id=bid, source=Source.BANK, gross_amount=inr(amount), ts=TS,
                        refs=TransactionRefs(utr=utr))
+
+
+def _short_pay_batch():
+    """One settlement short-paid by 200 -- a single recoverable leak to target."""
+    return [s("s2", "3000.00", "U2")], [bnk("b2", "2800.00", "U2")]
 
 
 # --------------------------------------------------------------------------
@@ -174,3 +184,113 @@ def test_failing_recovery_leaves_leak():
     assert rep.recoveries[0].final_state is RecoveryState.EXHAUSTED
     assert rep.recovered_amount == inr("0")
     assert len(rep.residual_leaks) == 1           # short payment not recovered -> stays
+
+
+# --------------------------------------------------------------------------
+# Phase 26 — uplift targeting inside the loop
+# --------------------------------------------------------------------------
+def _uplift_bits():
+    from reclaim import uplift as U
+    return U
+
+
+def _targeting(treated, control, *, unknown=None, days=1):
+    """A Targeting whose model was fitted on one cell with the given counts."""
+    U = _uplift_bits()
+    from reclaim.measurement import Arm as _Arm
+
+    def context_for(leak):
+        return U.Context(failure_reason=FailureReason.INSUFFICIENT_FUNDS,
+                         amount=leak.amount, days_since_failure=days, prior_failures=0)
+
+    rows = []
+    for arm, (n, got) in ((_Arm.TREATED, treated), (_Arm.CONTROL, control)):
+        for i in range(n):
+            rows.append(U.TrainingRow(
+                context=U.Context(FailureReason.INSUFFICIENT_FUNDS,
+                                  Money.of("200.00", "INR"), days, 0),
+                arm=arm, recovered=i < got))
+    model = U.fit(rows, min_support=10)
+    kwargs = {} if unknown is None else {"unknown": unknown}
+    return Targeting(model=model, context_for=context_for, **kwargs)
+
+
+def test_targeting_chases_a_persuadable_leak():
+    settlements, banks = _short_pay_batch()
+    rep = run_reclaim(settlements, banks, recovery_engine=RecoveryEngine(AlwaysSucceedsExecutor()),
+                      base_time=TS, targeting=_targeting((100, 60), (100, 20)))
+    assert rep.skipped_leaks == ()
+    assert rep.recovered_amount == Money.of("200.00", "INR")
+
+
+def test_targeting_skips_a_sure_thing_and_reports_the_value_it_left():
+    """Skipping is a decision with a cost, and the cost is in the summary."""
+    settlements, banks = _short_pay_batch()
+    rep = run_reclaim(settlements, banks, recovery_engine=RecoveryEngine(AlwaysSucceedsExecutor()),
+                      base_time=TS, targeting=_targeting((100, 90), (100, 85)))
+    assert rep.recoveries == ()
+    assert len(rep.skipped_leaks) == 1
+    leak, reason = rep.skipped_leaks[0]
+    assert leak.id == "leak:short:s2" and "sure_thing" in reason
+    assert rep.skipped_amount() == Money.of("200.00", "INR")
+    s = rep.summary()
+    assert s["targeting_skipped"] == 1
+    assert s["targeting_skipped_amount"] == "200.00 INR"
+    # a skipped leak is still an honest residual -- it did not disappear
+    assert "leak:short:s2" in {l.id for l in rep.residual_leaks}
+
+
+def test_targeting_never_chases_a_sleeping_dog():
+    settlements, banks = _short_pay_batch()
+    rep = run_reclaim(settlements, banks, recovery_engine=RecoveryEngine(AlwaysSucceedsExecutor()),
+                      base_time=TS, targeting=_targeting((100, 30), (100, 60)))
+    assert rep.recoveries == ()
+    assert "sleeping_dog" in rep.skipped_leaks[0][1]
+
+
+def test_an_unknown_estimate_still_chases_by_default():
+    settlements, banks = _short_pay_batch()
+    rep = run_reclaim(settlements, banks, recovery_engine=RecoveryEngine(AlwaysSucceedsExecutor()),
+                      base_time=TS, targeting=_targeting((2, 1), (2, 0)))
+    assert rep.skipped_leaks == () and len(rep.recoveries) == 1
+
+
+def test_the_unknown_policy_can_be_told_to_skip():
+    U = _uplift_bits()
+    settlements, banks = _short_pay_batch()
+    rep = run_reclaim(settlements, banks, recovery_engine=RecoveryEngine(AlwaysSucceedsExecutor()),
+                      base_time=TS,
+                      targeting=_targeting((2, 1), (2, 0), unknown=U.UnknownPolicy.SKIP))
+    assert len(rep.skipped_leaks) == 1
+
+
+def test_the_control_arm_is_decided_before_targeting():
+    """A held-out unit that targeting would also have skipped must still count
+    as control, or the experiment stops measuring the policy that was deployed."""
+    from reclaim.measurement import HoldoutPolicy
+    settlements, banks = _short_pay_batch()
+    rep = run_reclaim(settlements, banks, recovery_engine=RecoveryEngine(AlwaysSucceedsExecutor()),
+                      base_time=TS, holdout=HoldoutPolicy(control_pct=100),
+                      targeting=_targeting((100, 90), (100, 85)))     # would skip it
+    assert len(rep.control_leaks) == 1
+    assert rep.skipped_leaks == ()
+
+
+def test_targeting_validates_its_parts():
+    U = _uplift_bits()
+    model = _targeting((10, 6), (10, 2)).model
+    with pytest.raises(PipelineError):
+        Targeting(model="not a model", context_for=lambda l: None)
+    with pytest.raises(PipelineError):
+        Targeting(model=model, context_for="not callable")
+    with pytest.raises(PipelineError):
+        Targeting(model=model, context_for=lambda l: None, unknown="chase")
+
+
+def test_without_targeting_nothing_changes():
+    """Regression guard: the parameter must be invisible when unused."""
+    settlements, banks = _short_pay_batch()
+    rep = run_reclaim(settlements, banks, recovery_engine=RecoveryEngine(AlwaysSucceedsExecutor()),
+                      base_time=TS)
+    assert rep.skipped_leaks == () and rep.skipped_amount() == Money.zero("INR")
+    assert rep.summary()["targeting_skipped"] == 0
