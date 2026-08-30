@@ -864,3 +864,88 @@ output pasted verbatim.
 - Cross-run contact caps and consent state remain unimplemented.
 
 ---
+
+## 2026-08-31 — Sprint 3, Phase 27: contextual bandit + offline policy evaluation
+
+**What:** `src/reclaim/bandit.py` and `src/reclaim/offline_eval.py`. This closes
+the last named gap in Layer 5 and, more importantly, the gap ADR-0024 and ADR-0026
+both recorded: a candidate policy could only be evaluated *after* deployment, by
+running it on customers. Acceptable for a recommendation carousel; not for a debit.
+
+**ε-greedy instead of Thompson sampling — a deliberate deviation from the
+architecture's named algorithm.** IPS and DR divide each logged reward by the
+probability the logging policy had of choosing that action. Thompson's action
+probabilities are an integral over the posterior and have to be *estimated*; an
+estimated propensity sits in the **denominator**, so its error is amplified by
+exactly the factor that makes importance weighting useful, and the bias cannot be
+bounded from the log. ε-greedy's propensities are exact and closed-form. The
+architecture asks for the evaluator as well as the sampler, so the sampler that
+makes the evaluator honest wins. The cost — less efficient exploration, no
+narrowing as evidence accumulates — is stated in ADR-0027 rather than glossed.
+
+- Exploration is **deterministic** (hashed from `salt + context + unit`, as the
+  holdout assigns cohorts) and **capped** at ε ≤ 0.5, with the reason in the error
+  message: exploration means sending a real customer a message the policy
+  believes is worse, a cost paid in somebody's inbox rather than in regret.
+- An **untried arm reads as ½, not 0**. Pessimism about the untried looks like
+  learning and is a self-fulfilling prophecy — the arm is never tried again, so
+  it never improves.
+- **Learning returns a new policy rather than mutating.** A policy that changed
+  under a caller holding a reference would make already-logged propensities
+  wrong, which is the one thing this module must not do.
+
+**The evaluator refuses more than it reports.** An importance-weighted estimator
+always returns *a* number; each condition under which it means nothing is checked
+and named. Zero propensity raises at construction. No overlap → `None` with the
+unsupported contexts listed, not a number with a caveat (which is why `ips`
+requires the full action set — otherwise it can only see actions that happen to
+be in the log, exactly the blind spot). Effective sample size and
+`max_weight_share` are always reported, because an estimate where one row carries
+90% of the weight is a sample of one wearing a sample of a thousand's clothes.
+Clipping is counted with its direction stated: variance down, estimate biased
+*toward the logging policy*, so a genuinely better target is understated.
+`should_deploy` gives four distinct refusal reasons — get coverage, get more
+data, get a better candidate, or accept the deployed policy is fine.
+
+ADR-0027.
+
+**A real bug the tests caught.** Quantizing each propensity independently left
+the distribution summing to `0.9999` for k=3. Small, and it would make every
+importance-weighted estimate a weighted sum against a distribution that is not
+one — a bias with no upper bound as weights grow. Fixed by quantizing the
+non-greedy share and letting the greedy arm absorb the remainder; found by a test
+asserting the sum across six (k, ε) combinations, not by review.
+
+**A test of mine that was wrong about the theory.** `test_dr_beats_ips_on_a_
+thinly_explored_arm` asserted DR lands closer to the truth than IPS on a single
+thinly-explored log. That is false: DR has lower variance *in expectation*, not
+smaller error on every sample, and on that log IPS happened to land closer
+(0.75 vs 0.55 against a truth of 0.80). Replaced with
+`test_dr_has_lower_error_than_ips_across_independent_draws`, which averages over
+12 independent reward draws — where the claim is actually true. Recorded because
+the failure was mine, not the code's, and the distinction is the kind a reviewer
+should be able to check.
+
+**How tested:** 60 new tests; full suite **690 passed, 100% line + branch**
+(3378 statements, 998 branches, 0 partial) across 32 modules. The estimators are
+graded against a known ground truth, which is the only way to know an evaluator
+works: `test_evaluating_the_logging_policy_returns_the_logs_own_mean` is the
+identity everything rests on, and
+`test_dr_survives_corrupted_propensities_when_the_model_is_right` is the property
+DR exists for — a perfect reward model and deliberately corrupted propensities,
+and it still recovers the true value.
+
+**Open items / honest notes:**
+- **Nothing in the recovery engine calls the bandit yet.** `RecoveryConfig.channels`
+  still rotates deterministically. Wiring it means threading a policy, a context
+  and a reward through `RecoveryEngine`, and the reward is not available until the
+  T+1 loop closes for that unit. Modules are real, tested and validated; the
+  integration is not done, and a half-wired path would be worse than saying so.
+- **No drift monitor.** §9.2 asks for one and these estimators are the right
+  substrate, but nothing re-evaluates a deployed policy on a rolling window and
+  alarms when its advantage evaporates.
+- **No reward model is fitted.** DR takes one from the caller; `uplift` is the
+  obvious candidate and connecting them is not done.
+- Cross-run contact caps and consent state remain unimplemented.
+
+---
