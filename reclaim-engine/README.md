@@ -18,12 +18,12 @@ These principles are elaborated in the architecture document (`../RECLAIM-System
 
 ```
 reclaim-engine/
-  src/reclaim/            # the engine — 22 modules, importable package, zero runtime deps
-  tests/                  # pytest suite (mirrors src) — 30 files, 420 tests
+  src/reclaim/            # the engine — 33 modules, importable package, zero runtime deps
+  tests/                  # pytest suite (mirrors src) — 38 files, 732 tests
   docs/
-    RUNBOOK.md            # one-page reproducible demo (commands + expected output)
+    RUNBOOK.md            # reproducible demo (commands + expected output)
     BUILD-LOG.md          # chronological log of what was built & tested
-    decisions/            # 21 Architecture Decision Records (ADRs)
+    decisions/            # 28 Architecture Decision Records (ADRs)
   examples/
     sample_batch.json     # the demo batch (amounts as strings → exact Money)
     sample_batch.csv      # the same batch as CSV (a test asserts they parse identically)
@@ -69,13 +69,36 @@ suite was re-run before the next began. Full narrative in [`docs/BUILD-LOG.md`](
 | 21 | `recovery` | `NoticeExecutor` seam (no debit without notice) + the RBI AFA ceiling |
 | 22 | `measurement` | Deterministic holdout cohorts and causal lift (goal G9) |
 | 23 | `scorecard` | The five-part ungameable scorecard |
+| 24 | `observation` · `experiment` | T+1 loop: outcomes read from the follow-up batch, never the executor's claim |
+| 25 | `control` | HITL gates as durable state — pause, persist, resume; decided exactly once |
+| 26 | `uplift` · `timing` | Four-quadrant persuadability; funded-moment prediction that cannot shorten the notice window |
+| 26b | `cycles` | Learn then target, over two periods — the loop closing end to end |
+| 27 | `bandit` · `offline_eval` | ε-greedy with exact propensities; IPS / DR that refuse when unidentified |
+| 28 | `conduct` | Consent (default deny), quiet hours, and contact caps that span runs |
 
-Each significant decision is an ADR in [`docs/decisions/`](docs/decisions/) (21 records).
+Each significant decision is an ADR in [`docs/decisions/`](docs/decisions/) (28 records).
+
+### Sprint 3 in one line each
+
+- **24** — `causal_recovered` stopped being permanently `null`. The demo prints
+  ₹27,000 *claimed* → ₹18,600 *observed* → ₹7,384.20 *causal*, and flags the 42 of
+  135 treated units where the engine said `RECOVERED` and the bank data disagreed.
+- **25** — escalation was a label on a report that then exited the process; it is
+  now a gate a named human answers, once, from the CLI.
+- **26 / 26b** — chasing everyone on the shipped fixture *claims* ₹19.86 lakh and
+  *destroys* ₹5.08 lakh of value. Targeting on uplift learned from one period of
+  observed outcomes makes a third of the contacts and turns it into +₹1.72 lakh.
+- **27** — a candidate policy can now be graded against logged data before a
+  customer feels it, and the evaluator returns `None` rather than a number when
+  the log cannot support one.
+- **28** — a daily re-run used to contact the same customer every day, three times
+  each, with every in-process invariant intact. It no longer does.
 
 ## Reproducible demo
 
-**[`docs/RUNBOOK.md`](docs/RUNBOOK.md)** — one page, ~2 minutes: exact commands, expected output for
-each, the sample data explained, the tamper-detection checks, and an
+**[`docs/RUNBOOK.md`](docs/RUNBOOK.md)** — ~3 minutes, 12 steps: exact commands, expected output for
+each, the sample data explained, the tamper-detection checks, the human exception queue, the measured
+causal lift, the two-cycle targeting demo, and an
 [honest-limits table](docs/RUNBOOK.md#honest-limits) separating what is real from what is simulated.
 Start there.
 
@@ -87,8 +110,8 @@ python -m pytest -v         # verbose
 python -m pytest --cov=reclaim --cov-branch    # coverage (line + branch)
 ```
 
-All tests must pass before any phase is considered complete. The suite runs **420 tests at
-100% line + branch coverage**.
+All tests must pass before any phase is considered complete. The suite runs **732 tests at
+100% line + branch coverage** (3,574 statements, 1,094 branches, 0 partial).
 
 ## Running the engine
 

@@ -7,7 +7,7 @@
 **Find every rupee that leaks. Win back what's winnable. Prove the books closed.**
 
 ![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-420%20passing-2ea44f)
+![Tests](https://img.shields.io/badge/tests-732%20passing-2ea44f)
 ![Coverage](https://img.shields.io/badge/coverage-100%25%20line%20%2B%20branch-2ea44f)
 ![License](https://img.shields.io/badge/license-MIT-0b3b8f)
 ![Status](https://img.shields.io/badge/build-passing-2ea44f)
@@ -60,7 +60,19 @@ A single system that **detects every leak, recovers what's recoverable within co
   itself after tampering, so self-consistency alone proves nothing, and we don't pretend otherwise.
 - **Measured, not asserted** — recovery is credited against a held-out control group, or reported
   as uncountable. Gross recovery is never presented as causal impact.
-- **Fully tested** — 22 modules, **420 tests, 100% line + branch coverage**, zero runtime dependencies.
+- **Observed, not claimed** — the T+1 loop reads each unit's outcome out of the *next bank file*,
+  for both arms, and reports where the engine's own `RECOVERED` claim the bank data does not confirm.
+  On the shipped demo that is 42 of 135 treated units.
+- **Targeted on uplift** — chase the persuadable, skip the sure things, and never chase a segment
+  that recovers *better* when left alone. On the shipped fixture, chasing everyone claims ₹19.86 lakh
+  and destroys ₹5.08 lakh of value; targeting makes a third of the contacts and turns it to +₹1.72 lakh.
+- **Graded before deployment** — IPS / doubly-robust offline evaluation, which returns `None` rather
+  than a number when the log cannot identify the policy being asked about.
+- **Human in an actual loop** — HITL gates are durable state: pause, persist, resume, decided exactly
+  once, by a named person, at a recorded time. Approval authorises; it never itself moves money.
+- **Conduct enforced in durable state** — consent defaults to *deny*, quiet hours, a cooling-off
+  period, and contact caps that span runs (a cap that only lives in memory is not a cap).
+- **Fully tested** — 33 modules, **732 tests, 100% line + branch coverage**, zero runtime dependencies.
 
 ## The loop
 
@@ -87,11 +99,18 @@ flowchart LR
 ```bash
 cd reclaim-engine
 
-python -m pytest --cov=reclaim --cov-branch      # 420 tests, 100% line + branch
+python -m pytest --cov=reclaim --cov-branch      # 732 tests, 100% line + branch
 python -m reclaim.demo                            # run the full loop (demo data)
 python -m reclaim examples/sample_batch.json      # reconcile a JSON batch
 python -m reclaim --csv examples/sample_batch.csv # …or CSV
+
+python -m reclaim.experiment                      # measured causal lift, T and T+1
+python -m reclaim.cycles                          # learn from cycle 1, target cycle 2
 ```
+
+The last two are the ones to run if you only run two. `experiment` shows the three
+recovery numbers — claimed, observed, causal — separating. `cycles` shows why that
+separation is worth having.
 
 Persist a run and verify it later (tamper-evident):
 
@@ -237,14 +256,14 @@ everything the engine *couldn't* settle sent to a human rather than guessed.
 (after recovery). They are kept separate on purpose — one number cannot show that recovery moved
 anything ([ADR-0014](reclaim-engine/docs/decisions/ADR-0014-closure-rate.md)).
 
-Every significant design decision is recorded as an Architecture Decision Record in [`reclaim-engine/docs/decisions/`](reclaim-engine/docs/decisions/) (21 ADRs).
+Every significant design decision is recorded as an Architecture Decision Record in [`reclaim-engine/docs/decisions/`](reclaim-engine/docs/decisions/) (28 ADRs).
 
 ## Repository layout
 
 ```
 .
 ├── reclaim-engine/                     the engine — Python 3.11+, src layout, zero runtime deps
-│   ├── src/reclaim/                    22 modules
+│   ├── src/reclaim/                    33 modules
 │   │   ├── money.py  domain.py         exact Decimal money + canonical types
 │   │   ├── ledger.py                   immutable double-entry ledger
 │   │   ├── leak_ledger.py              append-only versioned store of every leak
@@ -256,6 +275,13 @@ Every significant design decision is recorded as an Architecture Decision Record
 │   │   ├── payments.py                 gateway executor behind the PaymentGateway seam
 │   │   ├── audit.py  signing.py        Merkle log (inclusion + consistency) + signing
 │   │   ├── measurement.py              holdout cohorts + causal lift
+│   │   ├── observation.py              T+1 loop — outcomes read from the next bank file
+│   │   ├── uplift.py                   four-quadrant persuadability (T-learner)
+│   │   ├── timing.py                   funded-moment prediction
+│   │   ├── bandit.py                   ε-greedy with exact, loggable propensities
+│   │   ├── offline_eval.py             IPS / doubly-robust policy evaluation
+│   │   ├── conduct.py                  consent, quiet hours, cross-run contact caps
+│   │   ├── control.py                  durable HITL gates (pause · persist · resume)
 │   │   ├── scorecard.py                the five-part ungameable scorecard
 │   │   ├── persistence.py              event-sourced append-only storage
 │   │   ├── verification.py             replay + tamper detection
@@ -263,12 +289,14 @@ Every significant design decision is recorded as an Architecture Decision Record
 │   │   ├── pipeline.py                 end-to-end orchestration → RunReport
 │   │   ├── cli.py  __main__.py         `python -m reclaim`
 │   │   ├── dashboard.py                self-contained HTML run report
-│   │   └── demo.py                     `python -m reclaim.demo`
-│   ├── tests/                          30 files · 420 tests · 100% line + branch
+│   │   ├── demo.py                     `python -m reclaim.demo`
+│   │   ├── experiment.py               `python -m reclaim.experiment` — measured lift
+│   │   └── cycles.py                   `python -m reclaim.cycles` — learn then target
+│   ├── tests/                          38 files · 732 tests · 100% line + branch
 │   ├── docs/
-│   │   ├── RUNBOOK.md                  one-page reproducible demo
+│   │   ├── RUNBOOK.md                  reproducible demo, 12 steps
 │   │   ├── BUILD-LOG.md                what was built, why, how it was tested
-│   │   └── decisions/                  21 Architecture Decision Records
+│   │   └── decisions/                  28 Architecture Decision Records
 │   ├── examples/                       sample_batch.json · .csv · demo_dashboard.html/.png
 │   ├── pyproject.toml                  project + pytest/coverage config
 │   └── README.md                       engine-level docs
