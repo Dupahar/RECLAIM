@@ -1109,3 +1109,100 @@ whose inclusion proof verifies),
   expressible — and the variance diagnostics were not calibrated for one.
 
 ---
+
+## 2026-08-31 — Post-Sprint-3: the medallion data platform (Layer 1)
+
+**What:** `src/reclaim/ingest.py` (Bronze → Silver → Gold), `--pg-csv` /
+`--bank-csv` on the CLI, and two demo fixtures. Layer 1 was the least-implemented
+layer (~10%) because `batch_io` and `csv_io` looked like enough. They are a
+*validating boundary*, and the difference from a platform cost money in three
+places rather than tidiness.
+
+**Nothing was replayable from source.** A malformed row raised and the batch
+stopped; there was no immutable record of what arrived, so "re-run yesterday's
+file and get the same answer" was a property of the file still being on disk.
+
+**A rejected row disappeared.** G2 is "nothing leaves the system undocumented",
+and a row that failed validation left no trace — the one category of data most
+likely to be hiding money, discarded with an exception message.
+
+**Reference normalisation had nowhere to live, and its absence fails silently.**
+A settlement export writes `UTR000123456789`; the statement writes it inside
+`NEFT-UTR000123456789-ACME`. Same reference, two spellings. Unnormalised, the
+exact matcher finds nothing, the batch reports **0% matched, and no error is
+raised anywhere** — the failure a validating boundary structurally cannot catch,
+because both files are individually valid. This actually happened: the first
+end-to-end run reported 0% with every row conformed.
+
+- **Bronze is content-addressed** (SHA-256 of the canonical row), so the same
+  delivery under a different filename is recognised as already known and a replay
+  can prove it read the same bytes. Duplicates are returned, not discarded.
+- **Silver's invariant is arithmetic:** every landed row ends in exactly one of
+  transactions or quarantine, and `accounted_for()` proves it. G2 as a count a
+  test can assert rather than an intention.
+- **Extraction reports a confidence and refuses below a threshold** — 1.0 for a
+  labelled `UTR…`, 0.75 for a bare run after a NEFT/IMPS/UPI/RTGS prefix (that
+  shape also appears in account numbers), 0 otherwise. Refusing is the point: a
+  wrong reference does not fail loudly, it **silently creates a false match**.
+- **Fees unpacked at the boundary**, so nothing downstream sees a gross amount it
+  could mistake for a payout.
+- **Only credits ingested** from a statement: a debit is not a payout, and
+  admitting one would invent money.
+- **Duplicate UTRs caught in Gold**, where the line number is still known, with
+  **both** rows quarantined — keeping the first would be a silent choice about
+  which is real, resolved by arrival order.
+
+ADR-0030.
+
+**Result — the CLI path, end to end:**
+
+```
+python -m reclaim --pg-csv examples/pg_settlement.csv \
+                  --bank-csv examples/bank_statement.csv
+  ingest: 11 row/s landed
+    conformed  : 4 settlement/s, 3 bank credit/s
+    quarantined: 4
+      - [adapter_rejected]    pg_settlement.csv line 5   'settlement_id' is required
+      - [adapter_rejected]    pg_settlement.csv line 6   'gross_amount' is not an amount
+      - [no_reference_found]  bank_statement.csv line 4  no recognised reference pattern
+      - [adapter_rejected]    bank_statement.csv line 5  direction is 'debit' ... would invent money
+    every landed row accounted for: True
+  matched 6346.60 INR (match rate 0.6286) · residual 950.00 INR (2 leaks)
+```
+
+**How tested:** 47 new tests; full suite **830 passed, 100% line + branch**
+(4062 statements, 1242 branches, 0 partial) across 35 modules.
+`test_every_landed_row_is_accounted_for`,
+`test_normalisation_makes_both_spellings_of_one_reference_agree` (the bug that
+occurred), `test_a_low_confidence_extraction_is_refused_rather_than_guessed`,
+`test_a_debit_is_refused_because_treating_it_as_a_payout_invents_money`,
+`test_both_sides_of_a_collision_are_quarantined`,
+`test_re_landing_a_file_changes_nothing_downstream`, and
+`test_lineage_survives_all_the_way_to_a_leak` — a leak traced back to the file
+and line it came from.
+
+**Dead code removed by the discipline.** Two `"normalises to nothing"` guards were
+written and proved unreachable: `normalise_utr` raises on a value that reduces to
+nothing, since an empty string is not alphanumeric. Deleted rather than kept alive
+by tests written to reach them — the same lesson as the Phase 3 balance guard and
+`CellStats.merge`.
+
+**Open items / honest notes:**
+- **No Kafka, no CDC, no streaming.** This is batch ingestion with medallion
+  *semantics* — lineage, immutability, quarantine, replay. Those have to be right
+  whatever moves the bytes, but the layer is not near-real-time. **G10 remains
+  outstanding.**
+- **Bronze is in memory**, so it replays within a process and not across a
+  restart — the gap ADR-0029 just closed for conduct state, one layer down. A
+  `BronzeRepository` is the obvious next step; claiming durability before it
+  exists would repeat exactly what ADR-0028 got wrong.
+- **No Gold aggregates.** Gold is the reconciliation-ready split with the
+  matcher's preconditions checked; the architecture's aggregated views are not
+  built because nothing consumes them.
+- **No Account Aggregator, no PDF, no LLM extractor.** The `NarrationExtractor`
+  seam exists with a deterministic implementation behind it and **no model is
+  called** — as with `ChatClient`.
+- **Two formats, not the long tail.** PayU, Cashfree and per-bank narration
+  dialects are uncovered, and the regex is not calibrated against real statements.
+
+---

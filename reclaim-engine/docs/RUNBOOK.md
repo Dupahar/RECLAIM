@@ -51,12 +51,12 @@ one row exercises each path:
 
 Amounts are **strings** in the input — they become exact `Decimal` `Money`, never float.
 
-## 1. Tests — 630 passing, 100% line + branch
+## 1. Tests — 830 passing, 100% line + branch
 
 ```bash
 python -m pytest --cov=reclaim --cov-branch
 ```
-→ `TOTAL 3050 statements, 878 branches, 0 missed, 100%` · `630 passed`
+→ `TOTAL 4062 statements, 1242 branches, 0 missed, 100%` · `830 passed`
 
 ## 2. Full closed loop (demo data, deterministic stand-ins for LLM + payment rail)
 
@@ -74,7 +74,7 @@ python -m reclaim.demo
 takes it to 64.96%; the remaining ₹750 is named, not hidden. `match_rate` is deliberately the
 *before* number — see [ADR-0014](decisions/ADR-0014-closure-rate.md).
 
-## 3. Reconcile a real batch file (detection-only — safe, no side effects)
+## 3. Reconcile a canonical batch file (detection-only — safe, no side effects)
 
 ```bash
 python -m reclaim examples/sample_batch.json           # human-readable
@@ -87,6 +87,56 @@ python -m reclaim --csv examples/sample_batch.csv      # same batch, CSV input
 Recovery is `0` here — and closure therefore equals detection — **by design**: the CLI runs
 detection only, so the short payment on s2 stays on the honest exception list instead of being
 recovered. JSON and CSV produce identical output.
+
+## 3b. Ingest a real-shaped delivery through the medallion layer
+
+`--pg-csv` and `--bank-csv` go through Bronze → Silver → Gold instead of the
+canonical loader: fees unpacked, references normalised, UTRs extracted from bank
+narration, and **every row that cannot be conformed reported rather than dropped**
+(architecture §4, [ADR-0030](decisions/ADR-0030-medallion-ingestion.md)).
+
+```bash
+python -m reclaim --pg-csv examples/pg_settlement.csv                   --bank-csv examples/bank_statement.csv
+```
+```
+ingest: 11 row/s landed
+  conformed  : 4 settlement/s, 3 bank credit/s
+  quarantined: 4
+    - [adapter_rejected] pg_settlement.csv line 5
+        pg_settlement.csv line 5: 'settlement_id' is required
+    - [adapter_rejected] pg_settlement.csv line 6
+        pg_settlement.csv line 6: 'gross_amount' is not an amount (could not parse amount 'not-a-number')
+    - [no_reference_found] bank_statement.csv line 4
+        bank_statement.csv line 4: no recognised reference pattern in narration 'CASH DEPOSIT BRANCH 4471'
+    - [adapter_rejected] bank_statement.csv line 5
+        bank_statement.csv line 5: direction is 'debit'; only credits are settlement payouts, and treating a debit as one would invent money
+  every landed row accounted for: True
+```
+→ then the usual report: `matched 6346.60 INR (match rate 0.6286)`, residual
+`950.00 INR` over 2 leaks.
+
+Three things to look at:
+
+**`every landed row accounted for: True`** is goal G2 as arithmetic. Every landed
+row is in exactly one of conformed or quarantined, and a test asserts the counts
+add up — a row cannot be silently dropped.
+
+**The reasons, not just the counts.** Each quarantined row keeps its file, line
+number and a reason aimed at whoever has to fix the file. A debit is refused with
+*"treating a debit as one would invent money"* rather than "invalid direction".
+
+**The match only happens because references are normalised.** The settlement file
+writes `UTR-000123456790`; the statement writes it inside
+`UPI/UTR000123456790/SETTLEMENT/ACME`. Same reference, two spellings. Without
+normalisation the exact matcher finds nothing and the batch reports **0% matched
+with no error raised anywhere** — both files being individually valid. That
+happened on the first end-to-end run, and it is the failure a validating boundary
+structurally cannot catch.
+
+> A low-confidence UTR extraction is **quarantined, not guessed**: a labelled
+> `UTR…` scores 1.0, a bare run after a `NEFT`/`IMPS`/`UPI` prefix 0.75 (the same
+> shape appears in account numbers), anything else 0. A wrong reference here does
+> not fail loudly — it silently creates a false match.
 
 ## 4. Visual run report (HTML dashboard)
 
@@ -353,7 +403,7 @@ What this demo does **not** prove, stated plainly so nobody has to infer it:
 
 | Claim | Status |
 |---|---|
-| Detection, fee decomposition, fuzzy matching, ledger balance | **Real** — deterministic, 420 tests |
+| Detection, fee decomposition, fuzzy matching, ledger balance | **Real** — deterministic, 830 tests |
 | Merkle audit, inclusion proofs, anchored replay, tamper detection | **Real** — demonstrated in step 7 |
 | Event-sourced persistence, idempotent re-persist, byte-stable artifacts | **Real** — steps 4–6 |
 | Recovery *outcomes* (₹200 recovered) | **Simulated** — `AlwaysSucceedsExecutor`, not a payment rail |
@@ -366,8 +416,13 @@ What this demo does **not** prove, stated plainly so nobody has to infer it:
 | Uplift targeting (four-quadrant persuadability) | **Real** — fitted from observed outcomes, wired into `run_reclaim`, demonstrated in step 11 (ADR-0024) |
 | Funded-moment predictor + scheduler seam | **Real and refusing** — the seam is advisory: a proposal at or before the notice deadline halts the recovery (ADR-0025). **But nothing sources funded moments** — no per-customer credit feed exists, so the predictor is fitted from caller-supplied history |
 | `Context.prior_failures` | **Unsourced** — required rather than defaulted, so the gap is visible at every call site |
-| Contextual bandit + IPS/DR offline evaluation | **Not implemented** — so a *new* targeting policy cannot yet be validated against logged data before it ships |
-| Cross-run contact caps and consent state | **Not implemented** — now possible (the Leak Ledger persists), not built |
+| Contextual bandit + IPS/DR offline evaluation | **Real** — ε-greedy with exact propensities (chosen so the evaluator is unbiased), IPS + doubly-robust, and a `should_deploy` gate that returns `None` rather than a number when the log cannot identify the policy (ADR-0027). Wired into the engine via `ActionPolicy`, with the reward taken from the T+1 bank data |
+| Drift monitoring | **Real** — reward drift and action-mix drift reported separately, `INSUFFICIENT_DATA` below `min_n` (ADR-0029). **Not scheduled** — a function, not a job |
+| Cross-run contact caps and consent state | **Real and durable** — consent defaults to *deny*, quiet hours, cooling-off, caps that span runs, and repositories so a cap survives a restart (ADR-0028, ADR-0029). **No shipped command writes them**, because nothing shipped contacts anyone |
+| Medallion ingestion (Bronze → Silver → Gold) | **Real** — content-addressed Bronze, an arithmetic "nothing dropped" invariant, reference normalisation, confidence-gated UTR extraction, duplicate-UTR quarantine (ADR-0030). **Bronze is in memory**, so it replays within a process, not across a restart |
+| Kafka / CDC / streaming ingestion | **Not implemented** — the ingest layer is batch with medallion *semantics*. **G10 (scale) remains outstanding** |
+| Account Aggregator, PDF statements, LLM extraction | **Not implemented** — the `NarrationExtractor` seam exists with a deterministic regex behind it; no model is called |
+| Per-customer funded-moment history and `prior_failures` | **Unsourced** — `customer_ref` now makes both assemblable from the Leak Ledger; nothing assembles them yet |
 
 Both external integrations (`ChatClient` → Anthropic, `PaymentGateway` → Razorpay test mode) are
 real drop-ins behind protocol seams with deterministic fakes, which is why the whole system is

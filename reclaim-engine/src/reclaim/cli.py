@@ -16,6 +16,14 @@ from datetime import datetime
 from .batch_io import BatchLoadError, load_batch_file
 from .control import ControlError, GateState, gates_for_run
 from .csv_io import load_batch_csv
+from .ingest import (
+    BankNarrationAdapter,
+    BronzeLayer,
+    IngestError,
+    PgSettlementAdapter,
+    to_gold,
+    to_silver,
+)
 from .ledger import LedgerError
 from .money import Money, MoneyError
 from .persistence import (
@@ -176,6 +184,53 @@ def _do_replay(replay_dir: str, expect_root, key) -> int:
     return 0 if (res.ok and sig_ok) else 1
 
 
+def _read_csv_rows(path: str) -> list[dict]:
+    """Rows exactly as the file has them — no coercion, that is Silver's job."""
+    import csv as _csv
+
+    text = pathlib.Path(path).read_text(encoding="utf-8-sig")
+    return [{k: v for k, v in row.items() if k is not None}
+            for row in _csv.DictReader(text.splitlines())]
+
+
+def _do_ingest(pg_csv, bank_csv, as_json: bool):
+    """Run a delivery through Bronze -> Silver -> Gold and report the quarantine.
+
+    Returns ``(settlements, banks, exit_code)``. The point of surfacing the
+    quarantine here rather than raising is goal G2: a row that could not be
+    conformed is the category most likely to be hiding money, so it is counted
+    and explained instead of stopping the batch.
+    """
+    bronze = BronzeLayer()
+    batches = []
+    for path, adapter in ((pg_csv, PgSettlementAdapter()),
+                          (bank_csv, BankNarrationAdapter())):
+        if path is None:
+            continue
+        source = pathlib.Path(path).name
+        new, duplicates = bronze.land(source, source, _read_csv_rows(path))
+        batches.append(to_silver(new, adapter, duplicates=duplicates))
+
+    lineage = {r.raw.get("settlement_id") or r.raw.get("txn_id"): r
+               for r in bronze.records()}
+    gold = to_gold(*batches, bronze_by_txn=lineage)
+    settlements, banks = gold.to_reconcile()
+
+    landed = sum(b.landed for b in batches)
+    skipped = sum(len(b.duplicates) for b in batches)
+    if not as_json:
+        print(f"ingest: {landed} row/s landed"
+              + (f", {skipped} already-known row/s skipped" if skipped else ""))
+        print(f"  conformed  : {len(settlements)} settlement/s, {len(banks)} bank credit/s")
+        print(f"  quarantined: {len(gold.quarantined)}")
+        for item in gold.quarantined:
+            print(f"    - [{item.rule}] {item.record.source} line {item.record.line_no}")
+            print(f"        {item.reason}")
+        accounted = all(b.accounted_for() for b in batches)
+        print(f"  every landed row accounted for: {accounted}")
+    return settlements, banks, gold
+
+
 def _gate_repo(d: pathlib.Path) -> GateRepository:
     return GateRepository(JsonlFileStore(d / GATES_FILE))
 
@@ -240,6 +295,12 @@ def main(argv=None) -> int:
                                                  "or verify a stored run with --replay.")
     parser.add_argument("batch", nargs="?", help="path to a JSON batch file")
     parser.add_argument("--csv", metavar="FILE", help="read the batch from a CSV file instead of JSON")
+    parser.add_argument("--pg-csv", metavar="FILE",
+                        help="ingest a gateway settlement export through the "
+                             "medallion layer (fees unpacked, quarantine reported)")
+    parser.add_argument("--bank-csv", metavar="FILE",
+                        help="ingest a bank statement whose UTR lives in the "
+                             "narration; low-confidence rows are quarantined")
     parser.add_argument("--json", action="store_true", help="emit a machine-readable JSON summary")
     parser.add_argument("--store", metavar="DIR",
                         help="persist the run's ledger + audit log (append-only) under DIR")
@@ -290,17 +351,24 @@ def main(argv=None) -> int:
         print("error: --decide needs --queue DIR to say which stored run to act on",
               file=sys.stderr)
         return 2
-    if not args.batch and not args.csv:
-        print("error: provide a batch file, --csv FILE, or --replay DIR to verify a stored run",
-              file=sys.stderr)
+    ingesting = bool(args.pg_csv or args.bank_csv)
+    if not args.batch and not args.csv and not ingesting:
+        print("error: provide a batch file, --csv FILE, --pg-csv/--bank-csv to ingest, "
+              "or --replay DIR to verify a stored run", file=sys.stderr)
         return 2
 
     try:
-        settlements, banks = (load_batch_csv(args.csv) if args.csv
-                              else load_batch_file(args.batch))
+        if ingesting:
+            settlements, banks, _gold = _do_ingest(args.pg_csv, args.bank_csv, args.json)
+        else:
+            settlements, banks = (load_batch_csv(args.csv) if args.csv
+                                  else load_batch_file(args.batch))
         rep = run_reclaim(settlements, banks)  # detection-only; no external deps
         at = datetime.fromisoformat(args.at) if args.at else _run_stamp(settlements, banks)
-    except (BatchLoadError, ReconciliationError) as exc:
+    except (BatchLoadError, ReconciliationError, IngestError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except OSError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except ValueError as exc:

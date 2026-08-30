@@ -633,3 +633,97 @@ def test_decide_against_a_missing_gate_log_is_an_error(tmp_path, capsys):
                "--actor", "ops@example.com", "--at", "2026-08-26T11:15:00"])
     assert rc == 2
     assert "no gate log found" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# Post-Sprint-3 — the medallion ingest path
+# --------------------------------------------------------------------------
+PG_CSV = pathlib.Path(__file__).resolve().parents[1] / "examples" / "pg_settlement.csv"
+BANK_CSV = pathlib.Path(__file__).resolve().parents[1] / "examples" / "bank_statement.csv"
+
+
+def test_ingest_reports_the_quarantine_and_still_reconciles(capsys):
+    """A row that cannot be conformed is counted and explained rather than
+    stopping the batch — the category most likely to be hiding money."""
+    rc = main(["--pg-csv", str(PG_CSV), "--bank-csv", str(BANK_CSV)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "11 row/s landed" in out
+    assert "conformed  : 4 settlement/s, 3 bank credit/s" in out
+    assert "quarantined: 4" in out
+    assert "every landed row accounted for: True" in out
+    # the reasons, not just the counts
+    assert "'settlement_id' is required" in out
+    assert "no recognised reference pattern" in out
+    assert "would invent money" in out
+    # and the reconciliation ran on what survived
+    assert "leak:short:s2" in out
+
+
+def test_ingest_normalises_references_so_the_two_files_match(capsys):
+    """The settlement file writes UTR-000123456790 and the statement writes it
+    inside a narration; unnormalised the batch would report 0% matched."""
+    main(["--pg-csv", str(PG_CSV), "--bank-csv", str(BANK_CSV), "--json"])
+    data = json.loads(capsys.readouterr().out)
+    assert data["matched"] == "6346.60 INR"
+    assert data["residual_leaks"] == 2
+
+
+def test_json_output_suppresses_the_ingest_narrative(capsys):
+    main(["--pg-csv", str(PG_CSV), "--json"])
+    out = capsys.readouterr().out
+    assert "row/s landed" not in out
+    json.loads(out)                         # still valid JSON on its own
+
+
+def test_either_side_can_be_ingested_alone(capsys):
+    rc = main(["--pg-csv", str(PG_CSV)])
+    out = capsys.readouterr().out
+    assert rc == 0 and "conformed  : 4 settlement/s, 0 bank credit/s" in out
+
+    rc = main(["--bank-csv", str(BANK_CSV)])
+    out = capsys.readouterr().out
+    assert rc == 0 and "conformed  : 0 settlement/s, 3 bank credit/s" in out
+
+
+def test_an_already_known_delivery_is_reported_as_skipped(tmp_path, capsys):
+    """The same rows twice in one delivery: content-addressed Bronze recognises
+    them and says how many it skipped."""
+    doubled = tmp_path / "doubled.csv"
+    rows = PG_CSV.read_text(encoding="utf-8").splitlines()
+    doubled.write_text("\n".join(rows + rows[1:]) + "\n", encoding="utf-8")
+    rc = main(["--pg-csv", str(doubled)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "already-known row/s skipped" in out
+
+
+def test_a_missing_ingest_file_is_an_error_not_a_traceback(capsys):
+    rc = main(["--pg-csv", "no/such/file.csv"])
+    assert rc == 2
+    assert "error:" in capsys.readouterr().err
+
+
+def test_a_malformed_ingest_file_is_an_error(tmp_path, capsys):
+    bad = tmp_path / "bad.csv"
+    bad.write_text("not,a,settlement\n1,2,3\n", encoding="utf-8")
+    rc = main(["--pg-csv", str(bad)])
+    out = capsys.readouterr().out
+    # every row quarantines; the run still completes with nothing to reconcile
+    assert rc == 0 and "quarantined: 1" in out
+
+
+def test_the_usage_error_mentions_the_ingest_flags(capsys):
+    rc = main([])
+    assert rc == 2
+    assert "--pg-csv/--bank-csv" in capsys.readouterr().err
+
+
+def test_an_ingested_run_can_be_stored_and_replayed(tmp_path, capsys):
+    run = tmp_path / "run"
+    rc = main(["--pg-csv", str(PG_CSV), "--bank-csv", str(BANK_CSV),
+               "--store", str(run)])
+    assert rc == 0
+    capsys.readouterr()
+    assert main(["--replay", str(run)]) == 0
+    assert "VERIFIED" in capsys.readouterr().out

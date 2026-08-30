@@ -7,7 +7,7 @@
 **Find every rupee that leaks. Win back what's winnable. Prove the books closed.**
 
 ![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-732%20passing-2ea44f)
+![Tests](https://img.shields.io/badge/tests-830%20passing-2ea44f)
 ![Coverage](https://img.shields.io/badge/coverage-100%25%20line%20%2B%20branch-2ea44f)
 ![License](https://img.shields.io/badge/license-MIT-0b3b8f)
 ![Status](https://img.shields.io/badge/build-passing-2ea44f)
@@ -71,8 +71,15 @@ A single system that **detects every leak, recovers what's recoverable within co
 - **Human in an actual loop** — HITL gates are durable state: pause, persist, resume, decided exactly
   once, by a named person, at a recorded time. Approval authorises; it never itself moves money.
 - **Conduct enforced in durable state** — consent defaults to *deny*, quiet hours, a cooling-off
-  period, and contact caps that span runs (a cap that only lives in memory is not a cap).
-- **Fully tested** — 33 modules, **732 tests, 100% line + branch coverage**, zero runtime dependencies.
+  period, and contact caps that span runs *and survive a restart* (a cap that only lives in memory
+  is not a cap).
+- **Nothing dropped at the door** — medallion ingestion where every landed row ends up either
+  conformed or quarantined *with its reason and line number*, proven by arithmetic rather than
+  asserted. A UTR extracted from bank narration below the confidence threshold is quarantined, never
+  guessed: a wrong reference does not fail loudly, it silently creates a false match.
+- **Watched after deployment** — drift monitoring reports reward drift and action-mix drift
+  separately, because the mix moves first and the reward is what matters.
+- **Fully tested** — 35 modules, **830 tests, 100% line + branch coverage**, zero runtime dependencies.
 
 ## The loop
 
@@ -99,13 +106,16 @@ flowchart LR
 ```bash
 cd reclaim-engine
 
-python -m pytest --cov=reclaim --cov-branch      # 732 tests, 100% line + branch
+python -m pytest --cov=reclaim --cov-branch      # 830 tests, 100% line + branch
 python -m reclaim.demo                            # run the full loop (demo data)
 python -m reclaim examples/sample_batch.json      # reconcile a JSON batch
 python -m reclaim --csv examples/sample_batch.csv # …or CSV
 
 python -m reclaim.experiment                      # measured causal lift, T and T+1
 python -m reclaim.cycles                          # learn from cycle 1, target cycle 2
+
+python -m reclaim --pg-csv examples/pg_settlement.csv \
+                  --bank-csv examples/bank_statement.csv   # medallion ingest + quarantine
 ```
 
 The last two are the ones to run if you only run two. `experiment` shows the three
@@ -256,15 +266,16 @@ everything the engine *couldn't* settle sent to a human rather than guessed.
 (after recovery). They are kept separate on purpose — one number cannot show that recovery moved
 anything ([ADR-0014](reclaim-engine/docs/decisions/ADR-0014-closure-rate.md)).
 
-Every significant design decision is recorded as an Architecture Decision Record in [`reclaim-engine/docs/decisions/`](reclaim-engine/docs/decisions/) (28 ADRs).
+Every significant design decision is recorded as an Architecture Decision Record in [`reclaim-engine/docs/decisions/`](reclaim-engine/docs/decisions/) (30 ADRs).
 
 ## Repository layout
 
 ```
 .
 ├── reclaim-engine/                     the engine — Python 3.11+, src layout, zero runtime deps
-│   ├── src/reclaim/                    33 modules
+│   ├── src/reclaim/                    35 modules
 │   │   ├── money.py  domain.py         exact Decimal money + canonical types
+│   │   ├── ingest.py                   Bronze → Silver → Gold, lineage + quarantine
 │   │   ├── ledger.py                   immutable double-entry ledger
 │   │   ├── leak_ledger.py              append-only versioned store of every leak
 │   │   ├── reconciliation.py           exact matching + typed leak detection
@@ -280,6 +291,7 @@ Every significant design decision is recorded as an Architecture Decision Record
 │   │   ├── timing.py                   funded-moment prediction
 │   │   ├── bandit.py                   ε-greedy with exact, loggable propensities
 │   │   ├── offline_eval.py             IPS / doubly-robust policy evaluation
+│   │   ├── drift.py                    reward + action-mix drift on a deployed policy
 │   │   ├── conduct.py                  consent, quiet hours, cross-run contact caps
 │   │   ├── control.py                  durable HITL gates (pause · persist · resume)
 │   │   ├── scorecard.py                the five-part ungameable scorecard
@@ -292,12 +304,13 @@ Every significant design decision is recorded as an Architecture Decision Record
 │   │   ├── demo.py                     `python -m reclaim.demo`
 │   │   ├── experiment.py               `python -m reclaim.experiment` — measured lift
 │   │   └── cycles.py                   `python -m reclaim.cycles` — learn then target
-│   ├── tests/                          38 files · 732 tests · 100% line + branch
+│   ├── tests/                          41 files · 830 tests · 100% line + branch
 │   ├── docs/
-│   │   ├── RUNBOOK.md                  reproducible demo, 12 steps
+│   │   ├── RUNBOOK.md                  reproducible demo, 13 steps
 │   │   ├── BUILD-LOG.md                what was built, why, how it was tested
-│   │   └── decisions/                  28 Architecture Decision Records
-│   ├── examples/                       sample_batch.json · .csv · demo_dashboard.html/.png
+│   │   └── decisions/                  30 Architecture Decision Records
+│   ├── examples/                       sample_batch.json · .csv · pg_settlement.csv
+│   │                                   bank_statement.csv · demo_dashboard.html/.png
 │   ├── pyproject.toml                  project + pytest/coverage config
 │   └── README.md                       engine-level docs
 ├── fintech-grid/                       India-first market research (value-chain grids)

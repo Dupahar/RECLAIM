@@ -18,12 +18,12 @@ These principles are elaborated in the architecture document (`../RECLAIM-System
 
 ```
 reclaim-engine/
-  src/reclaim/            # the engine — 33 modules, importable package, zero runtime deps
-  tests/                  # pytest suite (mirrors src) — 38 files, 732 tests
+  src/reclaim/            # the engine — 35 modules, importable package, zero runtime deps
+  tests/                  # pytest suite (mirrors src) — 41 files, 830 tests
   docs/
     RUNBOOK.md            # reproducible demo (commands + expected output)
     BUILD-LOG.md          # chronological log of what was built & tested
-    decisions/            # 28 Architecture Decision Records (ADRs)
+    decisions/            # 30 Architecture Decision Records (ADRs)
   examples/
     sample_batch.json     # the demo batch (amounts as strings → exact Money)
     sample_batch.csv      # the same batch as CSV (a test asserts they parse identically)
@@ -75,8 +75,10 @@ suite was re-run before the next began. Full narrative in [`docs/BUILD-LOG.md`](
 | 26b | `cycles` | Learn then target, over two periods — the loop closing end to end |
 | 27 | `bandit` · `offline_eval` | ε-greedy with exact propensities; IPS / DR that refuse when unidentified |
 | 28 | `conduct` | Consent (default deny), quiet hours, and contact caps that span runs |
+| 29 | `drift` + six fixes | Closing the caveats Sprint 3 wrote about itself (ADR-0029) |
+| 30 | `ingest` | Bronze → Silver → Gold: lineage, an arithmetic "nothing dropped" invariant, confidence-gated UTR extraction |
 
-Each significant decision is an ADR in [`docs/decisions/`](docs/decisions/) (28 records).
+Each significant decision is an ADR in [`docs/decisions/`](docs/decisions/) (30 records).
 
 ### Sprint 3 in one line each
 
@@ -93,12 +95,19 @@ Each significant decision is an ADR in [`docs/decisions/`](docs/decisions/) (28 
   the log cannot support one.
 - **28** — a daily re-run used to contact the same customer every day, three times
   each, with every in-process invariant intact. It no longer does.
+- **29** — six items each ADR had flagged as incomplete: a cap that survives a
+  restart, a leak that knows whose money it is, the two modules that disagreed
+  about `confidence`, the bandit actually being called, a gate that can prove what
+  it was asked about, and a monitor that notices a policy going stale.
+- **30** — `batch_io` was a validating *boundary*, not a platform. A rejected row
+  used to vanish; reference normalisation had nowhere to live, and its absence
+  reported **0% matched with no error raised anywhere**.
 
 ## Reproducible demo
 
-**[`docs/RUNBOOK.md`](docs/RUNBOOK.md)** — ~3 minutes, 12 steps: exact commands, expected output for
-each, the sample data explained, the tamper-detection checks, the human exception queue, the measured
-causal lift, the two-cycle targeting demo, and an
+**[`docs/RUNBOOK.md`](docs/RUNBOOK.md)** — ~3 minutes, 13 steps: exact commands, expected output for
+each, the sample data explained, medallion ingestion with its quarantine, the tamper-detection checks,
+the human exception queue, the measured causal lift, the two-cycle targeting demo, and an
 [honest-limits table](docs/RUNBOOK.md#honest-limits) separating what is real from what is simulated.
 Start there.
 
@@ -110,8 +119,8 @@ python -m pytest -v         # verbose
 python -m pytest --cov=reclaim --cov-branch    # coverage (line + branch)
 ```
 
-All tests must pass before any phase is considered complete. The suite runs **732 tests at
-100% line + branch coverage** (3,574 statements, 1,094 branches, 0 partial).
+All tests must pass before any phase is considered complete. The suite runs **830 tests at
+100% line + branch coverage** (4,062 statements, 1,242 branches, 0 partial).
 
 ## Running the engine
 
