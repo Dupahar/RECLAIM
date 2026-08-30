@@ -1,7 +1,8 @@
 # RECLAIM — Demo Runbook
 
 Reproduce the full loop in ~2 minutes. **No install, no network, no API keys, no dependencies**
-beyond Python 3.11+ (`pytest` only for step 1). Every output below is verbatim from a real run.
+beyond Python 3.11+ (`pytest` only for step 1). Every output below is verbatim from a real run,
+with paths shown POSIX-style (Windows prints `run\root.txt`) and key-dependent signatures elided.
 
 > **Scope of this demo.** Detection, booking, audit and replay-verification are real. **Recovery
 > outcomes are a deterministic simulation** — the demo uses a stand-in executor behind the tested
@@ -100,8 +101,9 @@ python -c "import os, pathlib; pathlib.Path('demo.key').write_bytes(os.urandom(3
 python -m reclaim examples/sample_batch.json --store ./run --key-file demo.key
 ```
 ```
-persisted: 2 postings, 4 audit events -> run  (audit root 2e01c7d00ad76c12...)
-published: run/root.txt (anchors --replay)
+persisted: 2 postings, 4 audit events -> run  (store now 4 events, root 2e01c7d00ad76c12...)
+leak ledger: 4 leaks, 2 still open -> run/leaks.jsonl
+published: run/root.txt (anchors --replay), head appended to roots.log
 signed: audit.sig written (HMAC-SHA256, sig ...)
 ```
 
@@ -128,6 +130,7 @@ replay verification: VERIFIED
   audit root       : 2e01c7d00ad76c124ad0d906a78caf5f6b524aa8aacb4ea0fb70bb56027482f6
   inclusion proofs : ok
   root matches     : True
+  append-only      : ok (vs 1 published head/s)
   signature        : VERIFIED
 ```
 **exit 0.** Note the `anchor` line: replay always states what it checked against. A replay with no
@@ -152,7 +155,8 @@ python -c "import pathlib; p = pathlib.Path('run/audit.jsonl'); L = p.read_text(
 python -m reclaim --replay ./run
 ```
 → `audit events: 2` · `inclusion proofs: ok` ← *the gutted log is internally consistent*
-→ `anchor: run/root.txt` · `root matches: False` · `replay verification: FAILED` · **exit 1**
+→ `anchor: run/root.txt` · `root matches: False` · `append-only: FAILED (vs 1 published head/s)`
+· `replay verification: FAILED` · **exit 1**
 
 **7c. Remove the anchor** — verification refuses rather than reporting a verdict it cannot justify:
 
@@ -162,7 +166,8 @@ rm run/root.txt && python -m reclaim --replay ./run
 → `error: UNANCHORED replay - tampering cannot be detected.` · **exit 2**
 
 **Exit codes:** `0` verified · `1` verification failed (unbalanced / bad proof / root mismatch /
-bad signature / corrupt data) · `2` usage error, including an unanchored replay.
+append-only violation / bad signature / corrupt data) · `2` usage error, including an unanchored
+replay.
 
 > `root.txt` is a *convenience* anchor: an attacker who can rewrite `audit.jsonl` can rewrite it too.
 > For real tamper evidence, keep the root somewhere the run directory's owner cannot silently edit —
