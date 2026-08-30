@@ -540,3 +540,69 @@ Architecture coverage by layer: Data Platform ~10% (unchanged), Ledger Core
   `resolver.Assessment` rejects `float` — carried over, still unresolved.
 
 ---
+
+## 2026-08-31 — Sprint 3, Phase 24: the T+1 observation loop
+
+**What:** `src/reclaim/observation.py` and a runnable `src/reclaim/experiment.py`
+(`python -m reclaim.experiment`). Sprint 2 left causal measurement assigned but
+never scored: `causal_recovered` was structurally unreachable. This phase
+re-reconciles a **follow-up batch** and reads each unit's outcome out of the
+bank data.
+
+- **Only observed resolution counts.** A unit is recovered when the T+1 run no
+  longer lists its leak as residual. `RecoveryOutcome.RECOVERED` — which means
+  "the executor returned success", a fact about an API call — is deliberately
+  *not* used as an outcome for either arm, because scoring treated units on the
+  engine's claim while scoring control units on bank data is asymmetric evidence
+  that biases flattering every time.
+- **The claim becomes a check on itself.** Engine said `RECOVERED`, follow-up
+  batch disagrees → the unit lands in `claimed_not_observed`. In the shipped
+  demo that fires for **42 of 135** treated units.
+- **Intention-to-treat.** A treated unit that halted, hit the AFA ceiling or
+  exhausted its attempts stays in the treated cohort as not-recovered. Dropping
+  it would measure "how well recovery works when it runs" — improvable by
+  refusing to run.
+- **Unobserved ≠ resolved.** A unit whose settlement is absent from the
+  follow-up batch is reported with a reason code, never counted as a win.
+  Superseded leaks are excluded from both cohorts; they were never real money.
+- Arms are read from what the run actually did (`report.control_leaks`), not
+  re-derived from a policy object that could disagree with the run.
+
+ADR-0022.
+
+**Why:** It was the single largest honest-limit in the project — the one line in
+the runbook that said "not yet produced". It is also the gap that a buyer would
+find first: every recovery vendor reports gross, and the difference between
+gross and causal is the entire product argument.
+
+**How tested:** 45 new tests; full suite **465 passed, 100% line + branch**
+(2183 statements, 594 branches, 0 partial) across 24 modules. The tests worth
+naming are the ones that try to make the module lie:
+`test_resolution_is_read_from_the_followup_not_from_the_engine` and
+`test_full_loop_catches_a_recovery_the_bank_data_never_confirms` (a claimed
+recovery with no bank evidence must score as not-recovered *and* be flagged);
+`test_a_unit_not_carried_forward_is_unobserved_not_recovered` ("we stopped
+looking" must not collapse into "the money arrived");
+`test_removing_the_control_group_reports_none_not_a_better_number`;
+`test_outcome_draw_is_independent_of_cohort_assignment` (a shared salt between
+holdout and fixture would manufacture a lift out of correlated hashes); and
+`test_claimed_exceeds_observed_exceeds_causal`, which pins the ordering of the
+three figures the loop exists to separate.
+
+**Result:** ✅ the demo now prints a *measured* lift. On the shipped fixture:
+**27.35 pp** lift, treated 93/135 vs control 27/65, and the three recovery
+numbers in descending order of honesty — **₹27,000 claimed → ₹18,600 observed →
+₹7,384.20 causal**, not underpowered. `notice_compliance` reaches `1.0000` for
+the first time (the experiment wires a `NoticeExecutor`).
+
+**Open items / honest notes:**
+- The two batches are **synthetic** and the T+1 fixture's rates are authored
+  (65% treated / 40% control), so the printed lift is a property of the fixture.
+  The machinery is real; no lift has been measured on production data.
+- No observation *window* is modelled. "By T+1" means "in the batch you handed
+  me"; a real deployment needs a stated window and a rule for units still in
+  flight at its close.
+- Nothing yet feeds the observed outcomes back as training signal — that is what
+  the uplift model and bandit will consume.
+
+---
