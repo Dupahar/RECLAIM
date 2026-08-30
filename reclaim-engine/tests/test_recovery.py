@@ -300,3 +300,99 @@ def test_the_real_timing_module_drops_into_the_seam():
     # notice deadline is 2026-08-26T09:00; the next predicted funded moment is
     # the 2nd of September at 10:00
     assert out.attempts[0].at_time == datetime(2026, 9, 2, 10, 0, 0)
+
+
+# --------------------------------------------------------------------------
+# Phase 28 — the conduct seam (cross-run caps and consent)
+# --------------------------------------------------------------------------
+def _gate(**kw):
+    from reclaim.conduct import ConductGate
+    kw.setdefault("customer_for", lambda l: "cust-1")
+    return ConductGate(**kw)
+
+
+def _allowing():
+    from reclaim.conduct import ConsentGrant, ConsentRegistry, ConsentState
+    registry = ConsentRegistry()
+    registry.record(ConsentGrant("cust-1", ConsentState.GRANTED, BASE - timedelta(days=1)))
+    return registry
+
+
+def test_without_consent_no_debit_is_attempted():
+    """Default deny reaches all the way into the engine: an unknown consent state
+    stops the first attempt, before any money moves."""
+    out = RecoveryEngine(AlwaysSucceedsExecutor(), conduct=_gate()).recover(
+        leak("500.00"), FailureReason.INSUFFICIENT_FUNDS, BASE)
+    assert out.final_state is RecoveryState.HALTED
+    assert out.attempts == ()
+    assert "conduct rule 'consent' refused attempt 1" in out.rationale
+
+
+def test_with_consent_the_sequence_runs_normally():
+    out = RecoveryEngine(AlwaysFailsExecutor(), RecoveryConfig(max_attempts=3),
+                         conduct=_gate(consent=_allowing())).recover(
+        leak("500.00"), FailureReason.INSUFFICIENT_FUNDS, BASE)
+    assert out.final_state is RecoveryState.EXHAUSTED
+    assert len(out.attempts) == 3
+
+
+def test_a_cap_reached_part_way_through_stops_the_next_attempt():
+    """The rule is consulted before *every* attempt, not just the first: a cap
+    can be reached mid-sequence."""
+    from reclaim.conduct import ConductPolicy, ContactLedger
+
+    ledger = ContactLedger()
+    gate = _gate(consent=_allowing(), contacts=ledger,
+                 policy=ConductPolicy(max_contacts_per_window=2, min_hours_between=0))
+    recorded = []
+
+    class _Recording:
+        def attempt(self, l, channel, at_time, idempotency_key):
+            gate.note(l, channel, at_time, idempotency_key)
+            recorded.append(idempotency_key)
+            return AttemptResult.FAILED
+
+    out = RecoveryEngine(_Recording(), RecoveryConfig(max_attempts=5),
+                         conduct=gate).recover(
+        leak("500.00"), FailureReason.INSUFFICIENT_FUNDS, BASE)
+    assert out.final_state is RecoveryState.HALTED
+    assert len(out.attempts) == 2                      # the cap, not max_attempts
+    assert "window_cap" in out.rationale
+    assert len(recorded) == 2
+
+
+def test_a_consent_withdrawal_mid_sequence_stops_the_next_debit():
+    from reclaim.conduct import ConductPolicy, ConsentGrant, ConsentState
+
+    registry = _allowing()
+    registry.record(ConsentGrant("cust-1", ConsentState.WITHDRAWN,
+                                 BASE + timedelta(hours=30)))
+    gate = _gate(consent=registry, policy=ConductPolicy(min_hours_between=0))
+    out = RecoveryEngine(AlwaysFailsExecutor(), RecoveryConfig(max_attempts=3),
+                         conduct=gate).recover(
+        leak("500.00"), FailureReason.INSUFFICIENT_FUNDS, BASE)
+    # attempt 1 lands at BASE+24h (before withdrawal); attempt 2 at BASE+48h
+    assert len(out.attempts) == 1
+    assert out.final_state is RecoveryState.HALTED
+    assert "conduct rule 'consent' refused attempt 2" in out.rationale
+
+
+def test_a_conduct_halt_carries_the_attempts_already_made():
+    from reclaim.conduct import ConductPolicy, ConsentGrant, ConsentState
+
+    registry = _allowing()
+    registry.record(ConsentGrant("cust-1", ConsentState.WITHDRAWN,
+                                 BASE + timedelta(hours=30)))
+    out = RecoveryEngine(AlwaysFailsExecutor(), RecoveryConfig(max_attempts=3),
+                         conduct=_gate(consent=registry,
+                                       policy=ConductPolicy(min_hours_between=0))).recover(
+        leak("500.00"), FailureReason.INSUFFICIENT_FUNDS, BASE)
+    assert out.attempts[0].at_time == BASE + timedelta(hours=24)
+    assert out.notice_at == BASE
+
+
+def test_without_a_conduct_rule_nothing_changes():
+    """Regression guard: the seam must be invisible when unused."""
+    out = RecoveryEngine(AlwaysSucceedsExecutor()).recover(
+        leak("500.00"), FailureReason.INSUFFICIENT_FUNDS, BASE)
+    assert out.final_state is RecoveryState.RECOVERED

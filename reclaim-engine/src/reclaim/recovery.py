@@ -129,6 +129,27 @@ class RecoveryExecutor(Protocol):
 
 
 @runtime_checkable
+class ConductRule(Protocol):
+    """The seam that answers "are we allowed to contact this person right now?".
+
+    ``max_attempts`` caps attempts *within one run*. Nothing here capped contacts
+    *across* runs, so a daily re-run would contact the same customer every day
+    while every in-process invariant held. A conduct rule reads durable state —
+    consent history and a contact ledger — and can therefore refuse for reasons
+    this engine cannot see from the leak alone. ``conduct.ConductGate`` is the
+    reference implementation.
+
+    Consulted before **every** attempt, not just the first: a cap can be reached
+    part-way through a sequence, and a consent withdrawal mid-sequence must stop
+    the next debit.
+    """
+
+    def __call__(self, leak: LeakRecord,
+                 at: datetime) -> object:  # pragma: no cover - protocol
+        ...
+
+
+@runtime_checkable
 class AttemptScheduler(Protocol):
     """The seam that decides *when* the first attempt happens.
 
@@ -174,11 +195,13 @@ class RecoveryEngine:
 
     def __init__(self, executor: RecoveryExecutor, config: RecoveryConfig = DEFAULT_CONFIG,
                  notice_executor: "Optional[NoticeExecutor]" = None,
-                 scheduler: "Optional[AttemptScheduler]" = None) -> None:
+                 scheduler: "Optional[AttemptScheduler]" = None,
+                 conduct: "Optional[ConductRule]" = None) -> None:
         self._executor = executor
         self._config = config
         self._notice_executor = notice_executor
         self._scheduler = scheduler
+        self._conduct = conduct
 
     def recover(self, leak: LeakRecord, reason: FailureReason, base_time: datetime) -> RecoveryOutcome:
         if not isinstance(base_time, datetime):
@@ -249,6 +272,13 @@ class RecoveryEngine:
             at = first_at + timedelta(hours=k * cfg.gap_hours)
             channel = cfg.channels[k % len(cfg.channels)]
             key = f"{leak.id}:attempt:{k}"
+            if self._conduct is not None:
+                ruling = self._conduct(leak, at)
+                if not ruling.allowed:
+                    return RecoveryOutcome(
+                        leak, RecoveryState.HALTED, tuple(attempts), None,
+                        f"conduct rule '{ruling.rule}' refused attempt {k + 1}: "
+                        f"{ruling.reason}", notice_at, notice_sent)
             try:
                 result = self._executor.attempt(leak, channel, at, key)
             except RecoveryError:

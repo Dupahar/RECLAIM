@@ -949,3 +949,72 @@ and it still recovers the true value.
 - Cross-run contact caps and consent state remain unimplemented.
 
 ---
+
+## 2026-08-31 — Sprint 3, Phase 28: conduct guardrails (consent + cross-run caps)
+
+**What:** `src/reclaim/conduct.py` and a `ConductRule` seam on `RecoveryEngine`,
+completing the architecture's three hard stopping rules — *"contact caps, RBI 24h
+notice, consent"* — of which two were enforced.
+
+**The gap, stated plainly, is embarrassing.** `max_attempts` capped attempts
+*within one run*. Nothing capped contacts *across* runs. Re-run yesterday's batch
+today and the same customer is contacted again, three more times, and the engine
+could not see that it had done so. **A daily cron would have produced textbook
+harassment while every in-process invariant held and all 690 tests passed.** A cap
+has to live in durable state or it is not a cap. And consent was not modelled at
+all, which is worse because the failure is silent: an engine that has never heard
+of consent behaves identically to one whose customers have all granted it.
+
+    consent -> quiet hours -> cooling-off -> window cap -> allowed
+
+- **Default deny.** An unknown consent state refuses, and with `require_consent`
+  on and *no registry supplied at all* every contact is refused rather than waved
+  through — so adopting the gate incrementally fails closed. "We have no record"
+  and "they said yes" must not produce the same behaviour.
+- **Consent is read as of a timestamp**, not as it stands now, so a replay of last
+  week's run sees last week's consent. A guardrail that re-decides history with
+  today's data cannot audit what was allowed at the time.
+- **Replay does not consume the allowance.** Contacts are idempotent by the same
+  `idempotency_key` the payment attempt already carries — the rule the money
+  ledger, audit log and Leak Ledger apply, extended to the state that lacked it.
+- **Rule order is deliberate.** Consent first, because it is the only rule whose
+  violation is a wrong done to a person rather than a policy breach; a test
+  asserts it outranks quiet hours when both would refuse.
+- **Consulted before every attempt**, so a cap reached mid-sequence and a consent
+  withdrawal mid-sequence both stop the next debit.
+- **A refusal halts and names the rule**, which is the shape the Phase 25 HITL
+  queue already renders — so "we are not allowed to contact this person" becomes a
+  question a human sees rather than a silent non-event.
+- **The gate authorises but does not record.** Something that did both would make
+  a dry run indistinguishable from a real one and consume an allowance every time
+  anyone asked a hypothetical.
+
+ADR-0028.
+
+**How tested:** 42 new tests; full suite **732 passed, 100% line + branch**
+(3574 statements, 1094 branches, 0 partial) across 33 modules. The load-bearing
+ones are cross-run, because that is the gap:
+`test_the_window_cap_binds_across_runs`,
+`test_replaying_a_contact_does_not_consume_the_allowance`,
+`test_a_cap_reached_part_way_through_stops_the_next_attempt`,
+`test_a_consent_withdrawal_mid_sequence_stops_the_next_debit`,
+`test_with_no_consent_registry_at_all_every_contact_is_refused`, and
+`test_consent_is_read_as_of_the_moment_not_as_it_stands_now`.
+
+**Open items / honest notes:**
+- **The conduct state is not persisted yet.** `ConsentRegistry` and
+  `ContactLedger` are in-memory, exactly as `LeakLedger` was before Phase 19 gave
+  it a repository. Since the whole argument of ADR-0028 is that a cap must be
+  durable, the cap currently survives a re-run within a process but **not a
+  restart**. Closing that with a `ConductRepository` is the obvious next task and
+  the reason this phase does not claim the rule is fully enforced.
+- `ConductGate.customer_for` defaults to the leak's own id, making caps per-leak
+  rather than per-customer. `LeakRecord` carries no customer identity, so there is
+  nothing better to default to; the docstring and a test say so rather than
+  letting it look correct.
+- Quiet hours are naive local hours — no timezone model, no per-customer locale.
+  Defensible for an India-first product, wrong for anything else, not parameterised.
+- Nothing feeds real consent events in: no Account Aggregator or mandate-registry
+  integration, so every demo populates the registry from the caller.
+
+---
