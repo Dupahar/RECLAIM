@@ -1,14 +1,17 @@
 # RECLAIM — Demo Runbook
 
-Reproduce the full loop in ~2 minutes. **No install, no network, no API keys, no dependencies**
+Reproduce the full loop in ~3 minutes. **No install, no network, no API keys, no dependencies**
 beyond Python 3.11+ (`pytest` only for step 1). Every output below is verbatim from a real run,
 with paths shown POSIX-style (Windows prints `run\root.txt`) and key-dependent signatures elided.
 
-> **Scope of this demo.** Detection, booking, audit and replay-verification are real. **Recovery
-> outcomes are a deterministic simulation** — the demo uses a stand-in executor behind the tested
-> `PaymentGateway` seam. RECLAIM does not send pre-debit notices, move real money, or measure causal
-> uplift against a control group. The RBI 24-hour window is *modelled* (notice time recorded,
-> attempts scheduled after it), not *executed*. See [Honest limits](#honest-limits).
+> **Scope of this demo.** Detection, booking, audit, replay-verification, the HITL gates, the
+> causal-measurement loop and uplift targeting are all real mechanisms. **Recovery outcomes are a
+> deterministic simulation** — every demo uses a stand-in executor behind the tested
+> `PaymentGateway` seam, so RECLAIM still moves no real money and dispatches no real notice. What
+> that means for the numbers in steps 10 and 11: the *machinery* that measures lift and targets on
+> it is real and adversarially tested, and the *batches it measures* are synthetic fixtures whose
+> outcome rates are authored. No lift has been measured on production data. See
+> [Honest limits](#honest-limits).
 
 ## 0. Setup
 
@@ -48,12 +51,12 @@ one row exercises each path:
 
 Amounts are **strings** in the input — they become exact `Decimal` `Money`, never float.
 
-## 1. Tests — 420 passing, 100% line + branch
+## 1. Tests — 630 passing, 100% line + branch
 
 ```bash
 python -m pytest --cov=reclaim --cov-branch
 ```
-→ `TOTAL 2025 statements, 554 branches, 0 missed, 100%` · `420 passed`
+→ `TOTAL 3050 statements, 878 branches, 0 missed, 100%` · `630 passed`
 
 ## 2. Full closed loop (demo data, deterministic stand-ins for LLM + payment rail)
 
@@ -174,15 +177,18 @@ replay.
 > commit it, file it on a ticket, or use `--key-file` and hold the key elsewhere
 > ([ADR-0015](decisions/ADR-0015-anchored-replay.md)).
 
-## 7b. The scorecard and the Leak Ledger
+## 8. The scorecard and the Leak Ledger
 
 ```bash
 python -c "from reclaim.demo import run_demo; from reclaim.scorecard import build_scorecard; import json; print(json.dumps(build_scorecard(run_demo()).summary(), indent=2))"
 ```
 Note two fields that stay honest by default: `causal_recovered` is `null` with the note *"no holdout
-was run, so recovery cannot be credited causally"*, and `notice_compliance` is `0.0000` because the
+was run, so recovery cannot be credited causally"*, and `notice_compliance` is `0.0000` because this
 demo supplies no `NoticeExecutor`. Both become real numbers only when the machinery behind them is
-actually used — see [ADR-0021](decisions/ADR-0021-causal-measurement.md).
+actually used — steps 10 and 11 supply a holdout and a notice channel, and there the same two fields
+read `7384.20 INR` and `1.0000`. That contrast is the point of
+[ADR-0021](decisions/ADR-0021-causal-measurement.md): the metric reports `null` until something
+earns it.
 
 The Leak Ledger persisted in step 5 is the human queue:
 
@@ -192,10 +198,153 @@ python -c "from reclaim.demo import run_demo; from reclaim.pipeline import build
 Four leaks were detected; one was recovered, two were `superseded` by a later fuzzy match (never
 real leaks), and exactly one is open — the same single leak the report calls residual.
 
-## 8. Reset
+## 9. The human exception queue — pause, persist, resume
+
+A run can now stop and ask. `--value-threshold` opens a HITL sign-off gate for
+any recoverable leak above the amount; escalations and halted recoveries open
+gates automatically (architecture §8, [ADR-0023](decisions/ADR-0023-hitl-control-plane.md)).
 
 ```bash
-rm -rf run demo.key          # PowerShell: Remove-Item -Recurse -Force run, demo.key
+python -c "import json, pathlib; pathlib.Path('big.json').write_text(json.dumps({'settlements': [{'id': 's5', 'gross_amount': '50000.00', 'currency': 'INR', 'ts': '2026-08-25T09:00:00', 'refs': {'utr': 'UTR-5'}}], 'bank_credits': [{'id': 'b5', 'gross_amount': '30000.00', 'currency': 'INR', 'ts': '2026-08-25T09:00:00', 'refs': {'utr': 'UTR-5'}}]}), encoding='utf-8')"
+python -m reclaim big.json --store ./run --value-threshold 15000
+```
+```
+human queue: 1 gate/s awaiting -> run/gates.jsonl  (answer with --queue --decide)
+```
+
+```bash
+python -m reclaim --queue ./run
+```
+```
+human queue: 1 awaiting / 1 total  (run/gates.jsonl)
+  [value_threshold] gate:value:leak:short:s5 20000.00 INR
+      Sign off chasing 20000.00 INR, above the 15000.00 INR threshold?
+      - leak type short_payment
+      - bank credit 30000.00 INR is below expected payout 50000.00 INR
+  parked behind unanswered questions: 20000.00 INR
+```
+
+`parked behind unanswered questions` is the cost of the queue, stated rather
+than left to be discovered. Now answer it — with a name and an explicit
+timestamp, because the engine never reads the clock (G4) and a decision with no
+name on it is not an audit trail:
+
+```bash
+python -m reclaim --queue ./run --decide gate:value:leak:short:s5 \
+    --verdict approve --actor ops@example.com --at 2026-08-26T11:15:00
+python -m reclaim --queue ./run          # a different process; the answer survived
+```
+```
+approved: gate:value:leak:short:s5 by ops@example.com at 2026-08-26T11:15:00
+  0 gate/s still awaiting a human
+
+human queue: 0 awaiting / 1 total  (run/gates.jsonl)
+  (approved by ops@example.com) gate:value:leak:short:s5
+```
+
+**A gate is decided once.** Two approvals of one high-value debit is the failure
+mode that costs a merchant real money, so it is refused by the state machine
+rather than by a UI that hides the button:
+
+```bash
+python -m reclaim --queue ./run --decide gate:value:leak:short:s5 \
+    --verdict reject --actor someone.else@example.com --at 2026-08-26T12:00:00
+```
+→ `error: gate 'gate:value:leak:short:s5' is already approved (decided by
+'ops@example.com'); a gate is decided once` · **exit 2**
+
+Approval **authorises but does not act** — money moves only when `control.resume`
+runs the bounded saga, under the same notice window, AFA ceiling and idempotency
+keys. A human "yes" on an over-ceiling debit still halts.
+
+## 10. Measured causal lift — the T+1 observation loop
+
+```bash
+python -m reclaim.experiment
+```
+```
+  treated / control   : 135 / 65
+  T+1 observation (outcomes read from the follow-up batch):
+    treated recovered : 93/135  (rate 0.6889)
+    control recovered : 27/65  (rate 0.4154)
+    lift              : 27.3500 pp
+    underpowered      : False
+  the three numbers, in descending order of honesty:
+    claimed  (engine said RECOVERED)      : 27000.00 INR
+    observed (bank data at T+1, treated)  : 18600.00 INR
+    causal   (net of the control cohort)  : 7384.20 INR
+  claimed but not observed : 42   <- engine said RECOVERED, bank data did not agree
+  notice compliance        : 1.0000
+```
+
+Three numbers, one loop. `claimed` is what the executor reported. `observed` is
+what the next bank file actually showed. `causal` is what is left after
+subtracting what the control cohort recovered without being touched — the only
+figure a merchant is really buying.
+
+**`claimed but not observed: 42`** is the engine auditing its own success metric:
+42 of 135 treated units were reported `RECOVERED` and the follow-up batch
+disagreed. Outcomes are read from bank data for *both* arms, never from the
+executor's claim, because asymmetric evidence between arms biases flattering
+every time ([ADR-0022](decisions/ADR-0022-observation-loop.md)).
+
+## 11. Learn, then target — the two-cycle demo
+
+The measurement earns its keep here. Cycle 1 chases everyone; its observed
+outcomes fit an uplift model; cycle 2 chases only what the model calls
+persuadable ([ADR-0024](decisions/ADR-0024-uplift-targeting.md)).
+
+```bash
+python -m reclaim.cycles
+```
+```
+  cohort: 900 short-paid settlements, three authored behaviours
+    sure thing       200.00  contacted 90% / untouched 85%  (+5pp)
+    persuadable     1500.00  contacted 65% / untouched 25%  (+40pp)
+    sleeping dog    8000.00  contacted 25% / untouched 55%  (-30pp)
+
+  what cycle 1's observed outcomes taught the model:
+       200.00 shortfall -> sure_thing   uplift 0.1166  => skip
+      1500.00 shortfall -> persuadable  uplift 0.4228  => chase
+      8000.00 shortfall -> sleeping_dog uplift -0.3926  => skip
+
+                                     cycle 1             cycle 2
+                            (chase everyone)          (targeted)
+  units contacted                        612                 204
+  contacts made                          612                 204
+  skipped by targeting                     0                 408
+  value skipped                        0 INR      1680600.00 INR
+  lift (pp)                           4.7200             18.3800
+  claimed recovered           1986600.00 INR       306000.00 INR
+  observed recovered           629300.00 INR      1164400.00 INR
+  CAUSAL recovered            -508425.82 INR       172093.30 INR
+  causal per contact               -830.7611            843.5946
+```
+
+Read the bottom two rows. **Chasing everyone claimed ₹19.9 lakh recovered and
+destroyed ₹5.08 lakh of value**, because the ₹8,000 cohort recovers *better* when
+left alone. Targeting made one third of the contacts and turned that into
+**+₹1.72 lakh causal** — from −₹830.76 to +₹843.59 per contact.
+
+The model was told nothing about which shortfall means which behaviour; it read
+all three out of one period of observed bank outcomes. A response model would
+have ranked the sure things first, because 90% is the highest recovery rate on
+the sheet.
+
+Both cohorts keep the full behaviour mix in both cycles: "treated" means the
+policy ran, which in cycle 2 includes units it chose not to contact. That keeps
+the lift a statement about the deployed policy rather than about a subset it
+selected — and is why `run_reclaim` assigns cohorts *before* targeting.
+
+> **The batches and the three behaviour profiles are synthetic**, so the *size* of
+> the improvement is a property of the fixture. The direction is not: given those
+> behaviours, skipping them is arithmetically better, and the code finds which
+> ones to skip unaided.
+
+## 12. Reset
+
+```bash
+rm -rf run demo.key big.json  # PowerShell: Remove-Item -Recurse -Force run, demo.key, big.json
 ```
 
 ## Honest limits
@@ -212,8 +361,13 @@ What this demo does **not** prove, stated plainly so nobody has to infer it:
 | LLM exception resolution | **Real code, not exercised here** — `llm_resolver` needs a key; the demo uses deterministic fakes |
 | Blocking, Leak Ledger, consistency proofs, AFA ceiling | **Real** — ADRs 0017–0020 |
 | Causal lift arithmetic + deterministic holdout | **Real** — `measurement`, ADR-0021 |
-| A *measured* lift figure | **Not yet produced** — cohorts are assigned and the maths is tested, but crediting real lift needs the T+1 re-reconciliation loop to observe whether held-out leaks self-resolved. Deliberately not faked |
-| Uplift model / funded-moment predictor / bandit | **Not implemented** — Sprint 3 |
+| A *measured* lift figure | **Real** — the T+1 observation loop reads outcomes from the follow-up batch for both arms and reports `claimed_not_observed` where the engine's claim disagrees (steps 10–11, ADR-0022). The *batches* are synthetic, so the printed lift is a property of the fixture, not evidence about real payments |
+| HITL gates — pause, persist, resume, decided-once | **Real** — step 9, ADR-0023 |
+| Uplift targeting (four-quadrant persuadability) | **Real** — fitted from observed outcomes, wired into `run_reclaim`, demonstrated in step 11 (ADR-0024) |
+| Funded-moment predictor + scheduler seam | **Real and refusing** — the seam is advisory: a proposal at or before the notice deadline halts the recovery (ADR-0025). **But nothing sources funded moments** — no per-customer credit feed exists, so the predictor is fitted from caller-supplied history |
+| `Context.prior_failures` | **Unsourced** — required rather than defaulted, so the gap is visible at every call site |
+| Contextual bandit + IPS/DR offline evaluation | **Not implemented** — so a *new* targeting policy cannot yet be validated against logged data before it ships |
+| Cross-run contact caps and consent state | **Not implemented** — now possible (the Leak Ledger persists), not built |
 
 Both external integrations (`ChatClient` → Anthropic, `PaymentGateway` → Razorpay test mode) are
 real drop-ins behind protocol seams with deterministic fakes, which is why the whole system is

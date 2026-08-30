@@ -767,3 +767,100 @@ cover it, the same lesson as the Phase 3 unreachable guard.
   not shown", which is the same criticism Sprint 2 earned for measurement.
 
 ---
+
+## 2026-08-31 — Sprint 3, Phase 26b: the loop closes — learn, then target
+
+**What:** `src/reclaim/cycles.py` (`python -m reclaim.cycles`), plus runbook
+steps 9–11 for the three capabilities Phases 24–26 added. Phase 26 shipped the
+uplift model with 76 tests and nothing using it end to end — the same criticism
+Sprint 2 earned for measurement, reappearing one layer up as "the model is
+fitted, but nobody targets with it". This closes it.
+
+    cycle 1: chase everyone       -> observe at T+1 -> fit an uplift model
+    cycle 2: chase the persuadable -> observe at T+1 -> compare
+
+A **separate** command rather than a rewrite of `reclaim.experiment`, whose
+numbers are quoted verbatim in ADR-0022, this log and the runbook; changing its
+cohort would have silently invalidated all three. `experiment` answers "does the
+measurement work", `cycles` answers "is it worth having".
+
+**Result — the strongest artifact in the project so far:**
+
+| | cycle 1 (chase everyone) | cycle 2 (targeted) |
+|---|---|---|
+| units contacted | 612 | 204 |
+| measured lift | 4.72 pp | 18.38 pp |
+| claimed recovered | ₹19,86,600 | ₹3,06,000 |
+| observed recovered | ₹6,29,300 | ₹11,64,400 |
+| **causal recovered** | **−₹5,08,425.82** | **+₹1,72,093.30** |
+| causal per contact | −₹830.76 | +₹843.59 |
+
+Chasing everyone claimed nearly ₹20 lakh recovered *while destroying ₹5 lakh of
+value*, because the ₹8,000 cohort recovers better when left alone. The model —
+told nothing about which shortfall means which behaviour — read all three out of
+one period of observed bank outcomes:
+
+```
+   200.00 shortfall -> sure_thing   uplift  0.1166  => skip
+  1500.00 shortfall -> persuadable  uplift  0.4228  => chase
+  8000.00 shortfall -> sleeping_dog uplift -0.3926  => skip
+```
+
+**A real design flaw this work surfaced.** At the first cohort size (210) the
+control cells held 16–20 units, the sleeping-dog cell fell below `min_support`,
+and the hierarchical fallback answered from the pool — which, with a single
+failure reason in the fixture, pools *across behaviours* and returned
+`persuadable` for the one segment that must never be chased. The model behaved
+exactly as designed and the design was wrong for that shape of data. Rather than
+lower `min_support` until the demo passed, the cohort was sized so every cell
+reads its own counts, and a test now asserts every estimate's basis is
+`BASIS_CELL`. The lesson — pooling by failure reason is nearly useless when
+there is only one failure reason — is recorded in ADR-0026 rather than smoothed
+over.
+
+**The statistical decision that keeps it honest.** Lift is measured over the
+whole policy, not the contacted subset: both arms retain all three behaviours in
+both cycles, because *treated* means "the policy ran", which in cycle 2 includes
+units it chose not to contact. Restricting the treated arm to contacted units
+while leaving the control arm whole would compare two different populations and
+inflate cycle 2 by construction. The fixture's outcome also keys off *contact*
+rather than arm — keying off the arm label would have made targeting look free
+and produced a demo that cannot fail.
+
+ADR-0026.
+
+**How tested:** 24 new tests; full suite **630 passed, 100% line + branch**
+(3050 statements, 878 branches, 0 partial) across 30 modules. The claim is
+attacked from both sides — that the model really discovered the behaviours
+(`test_the_model_discovers_all_three_behaviours_unaided`,
+`test_every_learned_estimate_comes_from_its_own_cell`,
+`test_training_labels_come_from_observed_outcomes_not_claims`: the executor
+always succeeds, so every treated label would be `True` if labels were claims),
+and that the improvement is not an artefact
+(`test_both_arms_still_contain_every_behaviour_in_cycle_two`,
+`test_the_outcome_draw_is_independent_of_cohort_assignment`,
+`test_the_two_cycles_draw_independently`).
+
+**Runbook brought current.** It had not been touched for Phases 24–26. Added
+step 9 (the human exception queue, driven from the CLI), step 10 (measured causal
+lift), step 11 (this demo); renumbered the stray `7b` heading to 8; corrected
+step 1's stale counts (420 → 630 tests); rewrote the scope note, which claimed
+RECLAIM cannot "measure causal uplift against a control group"; and replaced
+three rows of the honest-limits table, including the "**Not yet produced**" entry
+for a measured lift figure. Every command in the new steps was executed and its
+output pasted verbatim.
+
+**Open items / honest notes:**
+- The batches and the three behaviour profiles are **synthetic**, so the *size* of
+  the improvement is a property of the fixture. The direction is not. Nothing
+  here is evidence about real Indian payment behaviour.
+- **Only two cycles run.** No drift detection, no retraining cadence, no guard
+  against a model that was right last month and wrong this one. A targeting
+  policy that degrades silently is the obvious next risk.
+- Cycle 2's policy is evaluated *after* deployment, by running it. Validating a
+  candidate policy against logged data **before** exposing customers needs
+  propensity logging and IPS/DR estimators — still absent, still the bandit's
+  prerequisite.
+- Cross-run contact caps and consent state remain unimplemented.
+
+---
