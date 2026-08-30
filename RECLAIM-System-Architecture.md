@@ -321,7 +321,7 @@ sequenceDiagram
     RE->>RE: probabilistic + AI resolver + verifier
     RE->>LG: post survivors / write leaks
     LG->>RC: recoverable leak (failed Autopay ₹499)
-    RC->>RC: diagnose=temporary; uplift=persuadable; predict funded-moment
+    RC->>RC: diagnose=temporary, uplift=persuadable, predict funded-moment
     RC->>RAIL: 24h notice, then idempotent retry at predicted time
     RAIL-->>RC: success
     RC->>LG: post recovery (balanced entries)
