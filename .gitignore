@@ -20,9 +20,6 @@ fintech-grid/_arch_combined.html
 *.docx
 *.local.md
 
-# Local tool/editor state (not part of the project)
-.claude/
-
 # Local run stores / keys
 run/
 *.key
