@@ -1018,3 +1018,94 @@ ones are cross-run, because that is the gap:
   integration, so every demo populates the registry from the caller.
 
 ---
+
+## 2026-08-31 — Post-Sprint-3: closing the caveats Sprint 3 wrote about itself
+
+**What:** six items, each one flagged as incomplete in the ADR of the phase that
+shipped it. Not deferred features — gaps that undermined the claim the phase had
+just made, and the first things a reviewer would have found.
+
+**1. A contact cap now survives a restart.** ADR-0028's whole argument is that a
+cap living in memory is not a cap, and it then shipped the registries in memory.
+`ConsentRepository` and `ContactRepository` follow the existing deduping-repository
+pattern. Consent is stored per grant, so a reloaded registry still answers
+`state_at` for a *past* timestamp — the property that makes a replay auditable
+rather than merely repeatable.
+
+**2. A leak knows whose money it is.** One missing field (`customer_ref`, carried
+from the settlement's counterparty) was blocking three capabilities: caps were
+per-*leak* not per-customer, funded-moment history had no key, and prior-failure
+counts could not be assembled. Where a source carries no counterparty the scope
+degrades to per-leak and `is_per_customer` reports it rather than letting it pass
+for the real thing. An empty-string ref is refused — it would pool every
+anonymous leak into one "customer" and share an allowance between strangers.
+
+**3. The two modules that disagreed about `confidence` now agree.** Carried since
+Sprint 2 and listed unresolved three times: `domain` rejected `Decimal` while
+`resolver.Assessment` rejected `float`. The consequence was real, not cosmetic — a
+probabilistic score or resolver confidence, both `Decimal`, could not reach a
+`LeakRecord` without a lossy conversion. Widened, so no caller changes.
+
+**4. The bandit is actually called.** ADR-0027 admitted nothing in the engine
+called it. An `ActionPolicy` seam chooses channel and message per attempt, and
+`RecoveryAttempt` records `action_key`, `propensity` and `context_key` — written at
+decision time, because a propensity reconstructed afterwards is a different
+number. `observation.logged_decisions` bridges a run and its T+1 outcomes into
+evaluator rows, with the reward taken from the **bank data**, never the executor's
+result: the executor always succeeds in the demos, so every row would read 1.
+
+Timing stays with `AttemptScheduler` — two components bidding for *when* would put
+the notice-window refusal in only one of them. Stated in the protocol docstring
+rather than left to be discovered: a bandit whose actions differ only by `hour`
+learns nothing through this seam.
+
+**A bug this surfaced.** The first bridge built the log's action key from the
+channel plus the *attempt's* hour, producing a key matching no action the policy
+knew about — so every offline estimate came back "not identified". The policy's own
+key is now stored verbatim.
+
+**5. A gate can prove what it was asked about.** ADR-0023 noted `audit_ref` existed
+and nothing populated it. A gate exists *because of* a logged decision, and those
+events are already in the Merkle log, so a gate points at the leaf that caused it
+without inventing event types. A gate whose subject has no event is left unstamped
+rather than pointed at an unrelated leaf.
+
+**6. A deployed policy is watched, not validated once.** `drift` reports two
+signals separately because they fail in that order: **reward drift** matters and
+moves last; **action-mix drift** (total-variation over chosen actions) moves first,
+because a policy collapsing onto one arm changes its mix before its reward becomes
+distinguishable. A pooled two-proportion z-test and an L1 distance, both in
+`Decimal`, both checkable by hand. Below `min_n` the verdict is
+`INSUFFICIENT_DATA` — a monitor that fires on twelve observations gets muted,
+after which its silence is uninformative too. `scan` compares every window to the
+**first**, because a slow decay passes a previous-window comparison every time
+while the policy quietly halves.
+
+ADR-0029.
+
+**How tested:** 29 new tests; full suite **783 passed, 100% line + branch**
+(3802 statements, 1168 branches, 0 partial) across 35 modules. Load-bearing:
+`test_a_contact_cap_survives_a_restart` (spend the allowance in one process,
+refuse in another), `test_a_reloaded_registry_still_answers_about_the_past`,
+`test_the_ips_identity_holds_on_a_log_the_engine_produced`,
+`test_a_better_policy_is_learned_and_then_graded_before_deployment`,
+`test_logged_decisions_reward_comes_from_the_bank_not_the_executor`,
+`test_a_gate_is_stamped_with_the_event_that_caused_it` (the ref resolves to a leaf
+whose inclusion proof verifies),
+`test_a_collapsed_action_mix_is_flagged_even_when_reward_holds`, and
+`test_scan_compares_every_window_to_the_first`.
+
+**Open items / honest notes:**
+- **No shipped command persists conduct state.** The repositories are tested
+  against JSONL on disk; nothing writes them, because nothing shipped contacts
+  anyone.
+- **`prior_failures` and funded-moment history are still unsourced.**
+  `customer_ref` makes both *possible* to assemble from the Leak Ledger; nothing
+  does yet. Same shape of gap, one step smaller.
+- **The drift monitor is not scheduled.** It is a function, not a job: nothing
+  calls it on a cadence or alerts on its verdict.
+- **The bandit's reward is binary.** `logged_decisions` emits 0/1 recovered and
+  discards the amount, so a policy optimising recovered *value* is not yet
+  expressible — and the variance diagnostics were not calibrated for one.
+
+---

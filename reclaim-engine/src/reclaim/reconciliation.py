@@ -159,7 +159,7 @@ def reconcile_settlements_to_bank(
                 id=f"leak:missing:{s.id}", amount=expected, leak_type=LeakType.MISSING_SETTLEMENT,
                 source_refs=(s.id,),
                 hypothesis="expected settlement payout not found among bank credits",
-                recoverable=False,
+                recoverable=False, customer_ref=s.counterparty,
             ))
             unmatched_settlements.append(s)
             continue
@@ -173,7 +173,7 @@ def reconcile_settlements_to_bank(
                 id=f"leak:short:{s.id}", amount=shortfall, leak_type=LeakType.SHORT_PAYMENT,
                 source_refs=(s.id, bank.id),
                 hypothesis=f"bank credit {bank_amt} is below expected payout {expected}",
-                recoverable=True,
+                recoverable=True, customer_ref=s.counterparty,
             ))
         else:  # bank_amt > expected
             excess = bank_amt - expected
@@ -181,7 +181,7 @@ def reconcile_settlements_to_bank(
                 id=f"leak:over:{s.id}", amount=excess, leak_type=LeakType.UNEXPLAINED_FEE,
                 source_refs=(s.id, bank.id),
                 hypothesis=f"bank credit {bank_amt} exceeds expected payout {expected}",
-                recoverable=False,
+                recoverable=False, customer_ref=s.counterparty,
             ))
 
     # Bank side — credits with no matching settlement
@@ -191,7 +191,7 @@ def reconcile_settlements_to_bank(
                 id=f"leak:unexpected:{b.id}", amount=b.gross_amount, leak_type=LeakType.TIMING,
                 source_refs=(b.id,),
                 hypothesis="bank credit with no matching settlement (possible timing or other source)",
-                recoverable=False,
+                recoverable=False, customer_ref=b.counterparty,
             ))
             unmatched_bank_credits.append(b)
 

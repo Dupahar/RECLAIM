@@ -41,10 +41,12 @@ different facts.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Optional
 
 from .domain import LeakRecord, LeakType, RecoveryState
 from .measurement import Arm, CausalLift, MeasurementError, Observation, measure_lift
+from .offline_eval import LoggedDecision
 
 
 class ObservationError(Exception):
@@ -252,3 +254,38 @@ def measure_followup_lift(prior, followup, *, min_cohort: int = 30) -> Optional[
         return report.measure(min_cohort=min_cohort)
     except MeasurementError:  # pragma: no cover - defensive: arms verified above
         return None
+
+
+# --------------------------------------------------------------------------
+# The bridge to offline policy evaluation
+# --------------------------------------------------------------------------
+def logged_decisions(prior, report: ObservationReport) -> tuple[LoggedDecision, ...]:
+    """Turn a run's bandit-chosen attempts into rows an IPS/DR estimator can use.
+
+    The reward is the *observed* outcome from the follow-up batch, not the
+    executor's result. An attempt whose ``AttemptResult`` was ``SUCCEEDED``
+    proves an API call returned, and training or evaluating a policy on that
+    would rank whichever action the rail happens to accept — a fact about the
+    gateway, not about customers (the same reasoning as ADR-0022).
+
+    Only attempts an ``ActionPolicy`` actually chose are included: an attempt
+    with no logged propensity cannot be evaluated offline, and inventing one
+    afterwards is exactly the bias ADR-0027 refuses. The first attempt per unit
+    is used, because later attempts in a sequence are not independent draws.
+    """
+    outcome_by_unit = {o.unit_id: o.recovered for o in report.observations}
+    rows: list[LoggedDecision] = []
+    for recovery in prior.recoveries:
+        reward = outcome_by_unit.get(recovery.leak.id)
+        if reward is None:
+            continue                     # never observed; nothing to learn from
+        for attempt in recovery.attempts:
+            if (attempt.propensity is None or attempt.context_key is None
+                    or attempt.action_key is None):
+                continue                 # not policy-chosen; unusable offline
+            rows.append(LoggedDecision(
+                unit_id=recovery.leak.id, context_key=attempt.context_key,
+                action_key=attempt.action_key, propensity=attempt.propensity,
+                reward=Decimal("1") if reward else Decimal("0")))
+            break
+    return tuple(rows)

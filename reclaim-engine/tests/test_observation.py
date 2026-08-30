@@ -39,6 +39,9 @@ from reclaim.reconciliation import MatchPair, ReconciliationResult
 from reclaim.recovery import (
     AlwaysFailsExecutor,
     AlwaysSucceedsExecutor,
+    Channel,
+    FailureReason,
+    RecoveryAttempt,
     RecoveryEngine,
     RecoveryOutcome,
 )
@@ -411,3 +414,167 @@ def test_fees_in_the_followup_do_not_break_the_census():
     later = run_reclaim([s], [bank("b1", "2882.00", "UTR-s1")])
     rep = observe_followup(prior, later)
     assert rep.observations[0].recovered is True     # tied out in full at T+1
+
+
+# --------------------------------------------------------------------------
+# Post-Sprint-3 — the bridge to offline policy evaluation
+# --------------------------------------------------------------------------
+def _bandit_run(*, epsilon="0.40", n=300, whatsapp_pct=70, upi_pct=30,
+                control_pct=20):
+    """A real pipeline run with a bandit choosing the channel, plus its T+1 batch.
+
+    WhatsApp genuinely works better in the fixture, so the log contains a signal
+    a policy could learn — and the reward comes from the follow-up batch, never
+    from the executor (which always succeeds).
+    """
+    import hashlib
+    from datetime import timedelta
+    from decimal import Decimal
+    from reclaim.bandit import Action, EpsilonGreedyBandit, EpsilonGreedyConfig
+    from reclaim.measurement import HoldoutPolicy
+    from reclaim.pipeline import run_reclaim
+    from reclaim.recovery import Channel
+
+    actions = [Action(Channel.UPI_RETRY, 10, "firm"),
+               Action(Channel.WHATSAPP_NUDGE, 10, "gentle")]
+    bandit = EpsilonGreedyBandit(actions,
+                                 config=EpsilonGreedyConfig(epsilon=Decimal(epsilon)))
+
+    def batch(resolved=frozenset(), ts=TS):
+        s, b = [], []
+        for i in range(n):
+            sid = f"s{i:03d}"
+            s.append(Transaction(id=sid, source=Source.SETTLEMENT,
+                                 gross_amount=inr("3000.00"), ts=ts,
+                                 refs=TransactionRefs(utr=f"U{sid}"),
+                                 counterparty=f"cust-{i}"))
+            b.append(Transaction(id=f"b{sid}", source=Source.BANK,
+                                 gross_amount=inr("3000.00" if sid in resolved
+                                                  else "2800.00"), ts=ts,
+                                 refs=TransactionRefs(utr=f"U{sid}")))
+        return s, b
+
+    engine = RecoveryEngine(
+        AlwaysSucceedsExecutor(),
+        action_policy=lambda l, attempt, at: bandit.choose("short-payment", l.id))
+    s0, b0 = batch()
+    prior = run_reclaim(s0, b0, recovery_engine=engine, base_time=TS,
+                        holdout=HoldoutPolicy(control_pct=control_pct, salt="bandit"))
+
+    def draw(uid):
+        return int.from_bytes(hashlib.sha256(f"o:{uid}".encode()).digest()[:8],
+                              "big") % 100
+
+    resolved = set()
+    for r in prior.recoveries:
+        rate = (whatsapp_pct if r.attempts[0].channel is Channel.WHATSAPP_NUDGE
+                else upi_pct)
+        if draw(r.leak.id) < rate:
+            resolved.add(r.leak.source_refs[0])
+    for l in prior.control_leaks:
+        if draw(l.id) < 25:
+            resolved.add(l.source_refs[0])
+    s1, b1 = batch(resolved, TS + timedelta(days=30))
+    return bandit, actions, prior, run_reclaim(s1, b1)
+
+
+def test_logged_decisions_reward_comes_from_the_bank_not_the_executor():
+    """The executor always succeeds. If rewards were the executor's result every
+    row would be 1, and a policy trained on that would rank whatever the rail
+    accepts — a fact about the gateway, not about customers."""
+    from reclaim.observation import logged_decisions
+
+    _b, _a, prior, later = _bandit_run()
+    log = logged_decisions(prior, observe_followup(prior, later))
+    rewards = {r.reward for r in log}
+    assert rewards == {D("0"), D("1")}
+    assert all(r.final_state.value == "recovered" for r in prior.recoveries)
+
+
+def test_the_ips_identity_holds_on_a_log_the_engine_produced():
+    """The end-to-end check: a log assembled from real attempts must reproduce
+    its own mean when the logging policy is evaluated."""
+    from reclaim.bandit import LoggingPolicyEcho
+    from reclaim.observation import logged_decisions
+    from reclaim.offline_eval import ips
+
+    bandit, actions, prior, later = _bandit_run()
+    log = logged_decisions(prior, observe_followup(prior, later))
+    keys = [a.key for a in actions]
+    estimate = ips(log, LoggingPolicyEcho(bandit).probability, actions=keys)
+    assert estimate.identified is True
+    assert estimate.value == estimate.logged_mean
+
+
+def test_a_better_policy_is_learned_and_then_graded_before_deployment():
+    """The whole point of Phase 27, exercised through the real engine."""
+    from reclaim.bandit import GreedyPolicy
+    from reclaim.observation import logged_decisions
+    from reclaim.offline_eval import ips, should_deploy
+    from reclaim.recovery import Channel
+
+    bandit, actions, prior, later = _bandit_run()
+    log = logged_decisions(prior, observe_followup(prior, later))
+    learned = bandit.observe_all([
+        (r.context_key, next(a for a in actions if a.key == r.action_key),
+         r.reward == D("1")) for r in log])
+    assert learned.greedy("short-payment").channel is Channel.WHATSAPP_NUDGE
+
+    verdict = should_deploy(ips(log, GreedyPolicy(learned).probability,
+                                actions=[a.key for a in actions]))
+    assert verdict.ship is True
+    assert "estimated improvement" in verdict.reason
+
+
+def test_only_the_first_attempt_of_a_sequence_is_logged():
+    """Later attempts in a sequence are not independent draws."""
+    from reclaim.bandit import Action, EpsilonGreedyBandit
+    from reclaim.observation import logged_decisions
+    from reclaim.recovery import AlwaysFailsExecutor, Channel, RecoveryConfig
+
+    l = leak("s1")
+    bandit = EpsilonGreedyBandit([Action(Channel.UPI_RETRY, 10, "firm")])
+    engine = RecoveryEngine(AlwaysFailsExecutor(), RecoveryConfig(max_attempts=3),
+                            action_policy=lambda lk, a, at: bandit.choose("ctx", lk.id))
+    outcome = engine.recover(l, FailureReason.INSUFFICIENT_FUNDS, TS)
+    assert len(outcome.attempts) == 3
+
+    prior = run(leaks=(l,), residual=(l,), recoveries=(outcome,))
+    later = run(leaks=(l,), residual=())
+    assert len(logged_decisions(prior, observe_followup(prior, later))) == 1
+
+
+def test_attempts_with_no_decision_record_are_skipped():
+    """An attempt with no logged propensity cannot be evaluated offline, and
+    inventing one afterwards is the bias ADR-0027 refuses."""
+    from reclaim.observation import logged_decisions
+
+    l = leak("s1")
+    plain = recovery(l, RecoveryState.RECOVERED)      # no attempts at all
+    prior = run(leaks=(l,), residual=(), recoveries=(plain,))
+    later = run(leaks=(l,), residual=())
+    assert logged_decisions(prior, observe_followup(prior, later)) == ()
+
+    unpolicied = RecoveryOutcome(
+        leak=l, final_state=RecoveryState.EXHAUSTED,
+        attempts=(RecoveryAttempt(0, Channel.UPI_RETRY, TS, "k", "failed"),),
+        recovered_amount=None, rationale="x", notice_at=TS)
+    prior = run(leaks=(l,), residual=(l,), recoveries=(unpolicied,))
+    assert logged_decisions(prior, observe_followup(prior, run(leaks=(l,), residual=(l,)))) == ()
+
+
+def test_a_unit_that_was_never_observed_contributes_no_row():
+    from reclaim.observation import logged_decisions
+
+    l = leak("s1")
+    outcome = RecoveryOutcome(
+        leak=l, final_state=RecoveryState.RECOVERED,
+        attempts=(RecoveryAttempt(0, Channel.UPI_RETRY, TS, "k", "succeeded",
+                                  action_key="upi_retry|10|firm", message="firm",
+                                  propensity=D("0.9"), context_key="ctx"),),
+        recovered_amount=l.amount, rationale="x", notice_at=TS)
+    prior = run(leaks=(l,), residual=(l,), recoveries=(outcome,))
+    later = run(leaks=(leak("s9"),), residual=())      # s1 not carried forward
+    report = observe_followup(prior, later)
+    assert report.observations == ()
+    assert logged_decisions(prior, report) == ()

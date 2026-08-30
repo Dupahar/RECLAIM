@@ -21,8 +21,17 @@ from datetime import datetime
 from typing import Protocol, runtime_checkable
 
 from .audit import AuditEvent, MerkleAuditLog
+from .conduct import (
+    ConductError,
+    ConsentGrant,
+    ConsentRegistry,
+    ConsentState,
+    ContactLedger,
+    ContactRecord,
+)
 from .control import ControlError, ControlPlane, Gate, GateKind, GateState
 from .domain import Direction, LeakRecord, LeakType, LedgerEntry, RecoveryState
+from .recovery import Channel
 from .leak_ledger import LeakLedger
 from .ledger import Ledger, Posting, LedgerError
 from .money import Money, MoneyError
@@ -134,7 +143,8 @@ def leak_to_record(l: LeakRecord) -> dict:
             "source_refs": list(l.source_refs), "hypothesis": l.hypothesis,
             "confidence": l.confidence, "recoverable": l.recoverable,
             "recovery_state": l.recovery_state.value,
-            "evidence": list(l.evidence), "audit_ref": l.audit_ref}
+            "evidence": list(l.evidence), "audit_ref": l.audit_ref,
+            "customer_ref": l.customer_ref}
 
 
 def leak_from_record(d, where: str = "leak") -> LeakRecord:
@@ -150,6 +160,7 @@ def leak_from_record(d, where: str = "leak") -> LeakRecord:
             recovery_state=RecoveryState(d.get("recovery_state", "none")),
             evidence=tuple(d.get("evidence", ())),
             audit_ref=d.get("audit_ref"),
+            customer_ref=d.get("customer_ref"),
         )
     except PersistenceError:
         raise
@@ -185,6 +196,43 @@ def gate_from_record(d, where: str = "gate") -> Gate:
         raise
     except Exception as exc:
         raise PersistenceError(f"{where}: invalid gate ({exc})") from exc
+
+
+def consent_to_record(g: ConsentGrant) -> dict:
+    return {"customer_id": g.customer_id, "state": g.state.value,
+            "at": g.at.isoformat(), "source": g.source,
+            "expires_at": g.expires_at.isoformat() if g.expires_at is not None else None}
+
+
+def consent_from_record(d, where: str = "consent") -> ConsentGrant:
+    try:
+        expires = d.get("expires_at")
+        return ConsentGrant(
+            customer_id=d["customer_id"], state=ConsentState(d["state"]),
+            at=datetime.fromisoformat(d["at"]), source=d.get("source", ""),
+            expires_at=datetime.fromisoformat(expires) if expires is not None else None)
+    except ConductError:
+        raise
+    except Exception as exc:
+        raise PersistenceError(f"{where}: invalid consent grant ({exc})") from exc
+
+
+def contact_to_record(c: ContactRecord) -> dict:
+    return {"customer_id": c.customer_id, "unit_id": c.unit_id,
+            "channel": c.channel.value, "at": c.at.isoformat(),
+            "idempotency_key": c.idempotency_key}
+
+
+def contact_from_record(d, where: str = "contact") -> ContactRecord:
+    try:
+        return ContactRecord(
+            customer_id=d["customer_id"], unit_id=d["unit_id"],
+            channel=Channel(d["channel"]), at=datetime.fromisoformat(d["at"]),
+            idempotency_key=d["idempotency_key"])
+    except ConductError:
+        raise
+    except Exception as exc:
+        raise PersistenceError(f"{where}: invalid contact record ({exc})") from exc
 
 
 def event_to_record(e: AuditEvent) -> dict:
@@ -307,6 +355,53 @@ class GateRepository(_DedupingRepository):
             plane.decide(gate.id, gate.state, actor=gate.decided_by,
                          at=gate.decided_at, rationale=gate.rationale)
         return plane
+
+
+class ConsentRepository(_DedupingRepository):
+    """Persists consent history and rehydrates an identical registry.
+
+    Every grant is stored, so ``state_at`` answers the same question after a
+    restart as before it — including for a timestamp in the past, which is the
+    property that makes a replay auditable rather than merely repeatable.
+    """
+
+    def save_grant(self, grant: ConsentGrant) -> None:
+        self._append_once(consent_to_record(grant))
+
+    def save_registry(self, registry: ConsentRegistry) -> None:
+        for customer_id in sorted(registry.customers()):
+            for grant in registry.history(customer_id):
+                self.save_grant(grant)
+
+    def load(self) -> ConsentRegistry:
+        registry = ConsentRegistry()
+        for i, rec in enumerate(self._store.read()):
+            registry.record(consent_from_record(rec, f"consent[{i}]"))
+        return registry
+
+
+class ContactRepository(_DedupingRepository):
+    """Persists the contact ledger — the state that makes a cap a cap.
+
+    ADR-0028 argues that a contact cap living only in memory is not a cap,
+    because a restart resets it. This is the store that makes the argument true.
+    Idempotent by content *and* by ``idempotency_key`` on rehydration, so neither
+    a re-persist nor a reload can consume a customer's allowance twice.
+    """
+
+    def save_contact(self, contact: ContactRecord) -> None:
+        self._append_once(contact_to_record(contact))
+
+    def save_ledger(self, ledger: ContactLedger) -> None:
+        for customer_id in sorted(ledger.customers()):
+            for contact in ledger.contacts_for(customer_id):
+                self.save_contact(contact)
+
+    def load(self) -> ContactLedger:
+        ledger = ContactLedger()
+        for i, rec in enumerate(self._store.read()):
+            ledger.record(contact_from_record(rec, f"contact[{i}]"))
+        return ledger
 
 
 class AuditRepository(_DedupingRepository):

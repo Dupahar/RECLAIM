@@ -344,7 +344,7 @@ def main(argv=None) -> int:
         if threshold is not None:
             plane = _gate_repo(store_dir).load()
             for gate in gates_for_run(rep, at or datetime(1970, 1, 1),
-                                      value_threshold=threshold):
+                                      value_threshold=threshold, audit=audit):
                 plane.open_gate(gate)
             _gate_repo(store_dir).save_plane(plane)
             print(f"human queue: {len(plane.awaiting())} gate/s awaiting "

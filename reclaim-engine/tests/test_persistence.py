@@ -1,5 +1,5 @@
 """Phase 11 tests — durable persistence (event-sourced ledger + audit)."""
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -435,3 +435,130 @@ def test_the_checkpointer_survives_a_restart_on_disk(tmp_path):
     assert final.current("g1").state is GateState.APPROVED
     assert final.awaiting() == ()
     assert len(final.history("g1")) == 2
+
+
+# --------------------------------------------------------------------------
+# Post-Sprint-3: durable conduct state — the claim ADR-0028 could not make
+# --------------------------------------------------------------------------
+def test_consent_history_round_trips_including_expiry():
+    from reclaim.conduct import ConsentGrant, ConsentRegistry, ConsentState
+    from reclaim.persistence import ConsentRepository
+
+    base = datetime(2026, 8, 1, 9, 0, 0)
+    registry = ConsentRegistry()
+    registry.record(ConsentGrant("cust-1", ConsentState.GRANTED, base,
+                                 source="mandate", expires_at=base.replace(month=12)))
+    registry.record(ConsentGrant("cust-2", ConsentState.WITHDRAWN, base))
+    store = InMemoryStore()
+    ConsentRepository(store).save_registry(registry)
+
+    reloaded = ConsentRepository(store).load()
+    assert reloaded.history("cust-1") == registry.history("cust-1")
+    assert reloaded.history("cust-2") == registry.history("cust-2")
+    assert reloaded.state_at("cust-1", base) is ConsentState.GRANTED
+    assert reloaded.state_at("cust-1", datetime(2027, 1, 1)) is ConsentState.EXPIRED
+
+
+def test_a_reloaded_registry_still_answers_about_the_past():
+    """The property that makes a replay auditable: consent as of *then*."""
+    from reclaim.conduct import ConsentGrant, ConsentRegistry, ConsentState
+    from reclaim.persistence import ConsentRepository
+
+    base = datetime(2026, 8, 1, 9, 0, 0)
+    registry = ConsentRegistry()
+    registry.record(ConsentGrant("cust-1", ConsentState.GRANTED, base))
+    registry.record(ConsentGrant("cust-1", ConsentState.WITHDRAWN,
+                                 datetime(2026, 9, 1, 9, 0, 0)))
+    store = InMemoryStore()
+    ConsentRepository(store).save_registry(registry)
+    reloaded = ConsentRepository(store).load()
+    assert reloaded.state_at("cust-1", datetime(2026, 8, 15)) is ConsentState.GRANTED
+    assert reloaded.state_at("cust-1", datetime(2026, 9, 15)) is ConsentState.WITHDRAWN
+
+
+def test_re_persisting_conduct_state_is_a_no_op():
+    from reclaim.conduct import ConsentGrant, ConsentRegistry, ConsentState, ContactLedger, ContactRecord
+    from reclaim.persistence import ConsentRepository, ContactRepository
+    from reclaim.recovery import Channel
+
+    base = datetime(2026, 8, 1, 9, 0, 0)
+    registry = ConsentRegistry()
+    registry.record(ConsentGrant("cust-1", ConsentState.GRANTED, base))
+    consent_store = InMemoryStore()
+    ConsentRepository(consent_store).save_registry(registry)
+    ConsentRepository(consent_store).save_registry(registry)
+    assert len(consent_store.read()) == 1
+
+    ledger = ContactLedger()
+    ledger.record(ContactRecord("cust-1", "leak:1", Channel.UPI_RETRY, base, "k1"))
+    contact_store = InMemoryStore()
+    ContactRepository(contact_store).save_ledger(ledger)
+    ContactRepository(contact_store).save_ledger(ledger)
+    assert len(contact_store.read()) == 1
+
+
+def test_a_corrupt_consent_or_contact_record_is_rejected():
+    from reclaim.conduct import ConductError
+    from reclaim.persistence import ConsentRepository, ContactRepository
+
+    bad_state = InMemoryStore()
+    bad_state.append({"customer_id": "c1", "state": "maybe", "at": "2026-08-01T09:00:00"})
+    with pytest.raises(PersistenceError):
+        ConsentRepository(bad_state).load()
+
+    empty_id = InMemoryStore()
+    empty_id.append({"customer_id": "", "state": "granted", "at": "2026-08-01T09:00:00"})
+    with pytest.raises(ConductError):
+        ConsentRepository(empty_id).load()
+
+    bad_channel = InMemoryStore()
+    bad_channel.append({"customer_id": "c1", "unit_id": "l1", "channel": "carrier_pigeon",
+                        "at": "2026-08-01T09:00:00", "idempotency_key": "k"})
+    with pytest.raises(PersistenceError):
+        ContactRepository(bad_channel).load()
+
+    empty_key = InMemoryStore()
+    empty_key.append({"customer_id": "c1", "unit_id": "l1", "channel": "upi_retry",
+                      "at": "2026-08-01T09:00:00", "idempotency_key": ""})
+    with pytest.raises(ConductError):
+        ContactRepository(empty_key).load()
+
+
+def test_a_contact_cap_survives_a_restart(tmp_path):
+    """ADR-0028's argument, made true. A cap that only lives in memory is not a
+    cap: restart the process and the customer's allowance silently resets."""
+    from reclaim.conduct import (
+        ConductPolicy, ConsentGrant, ConsentRegistry, ConsentState,
+        ContactLedger, ContactRecord, may_contact,
+    )
+    from reclaim.persistence import ConsentRepository, ContactRepository, JsonlFileStore
+    from reclaim.recovery import Channel
+
+    base = datetime(2026, 8, 1, 9, 0, 0)
+    policy = ConductPolicy(max_contacts_per_window=2, window_days=30,
+                           min_hours_between=0, quiet_hours=None)
+    consent_path, contact_path = tmp_path / "consent.jsonl", tmp_path / "contacts.jsonl"
+
+    # --- process 1: consent granted, allowance spent ---
+    registry = ConsentRegistry()
+    registry.record(ConsentGrant("cust-1", ConsentState.GRANTED, base))
+    ConsentRepository(JsonlFileStore(consent_path)).save_registry(registry)
+    ledger = ContactLedger()
+    for i in range(2):
+        at = base + timedelta(days=i)
+        assert may_contact("cust-1", at, consent=registry, contacts=ledger,
+                           policy=policy).allowed is True
+        ledger.record(ContactRecord("cust-1", "leak:1", Channel.UPI_RETRY, at, f"k{i}"))
+    ContactRepository(JsonlFileStore(contact_path)).save_ledger(ledger)
+
+    # --- process 2: a fresh start reads the same allowance ---
+    reloaded_consent = ConsentRepository(JsonlFileStore(consent_path)).load()
+    reloaded_contacts = ContactRepository(JsonlFileStore(contact_path)).load()
+    assert reloaded_contacts.size == 2
+    ruling = may_contact("cust-1", base + timedelta(days=3), consent=reloaded_consent,
+                         contacts=reloaded_contacts, policy=policy)
+    assert ruling.allowed is False and ruling.rule == "window_cap"
+
+    # --- and reloading twice still does not consume anything ---
+    again = ContactRepository(JsonlFileStore(contact_path)).load()
+    assert again.size == 2

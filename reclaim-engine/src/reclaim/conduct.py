@@ -115,6 +115,10 @@ class ConsentRegistry:
     def history(self, customer_id: str) -> tuple[ConsentGrant, ...]:
         return tuple(self._grants.get(customer_id, ()))
 
+    def customers(self) -> tuple[str, ...]:
+        """Every customer with a recorded grant — what a repository iterates."""
+        return tuple(self._grants)
+
     def state_at(self, customer_id: str, at: datetime) -> ConsentState:
         """Consent as it stood at ``at`` — not as it stands now.
 
@@ -186,6 +190,10 @@ class ContactLedger:
 
     def contacts_for(self, customer_id: str) -> tuple[ContactRecord, ...]:
         return tuple(self._by_customer.get(customer_id, ()))
+
+    def customers(self) -> tuple[str, ...]:
+        """Every customer with a recorded contact — what a repository iterates."""
+        return tuple(self._by_customer)
 
     def count_since(self, customer_id: str, since: datetime, until: datetime) -> int:
         """Contacts in the half-open window ``(since, until]``."""
@@ -340,13 +348,24 @@ class ConductGate:
     consent: Optional[ConsentRegistry] = None
     contacts: Optional[ContactLedger] = None
     policy: ConductPolicy = DEFAULT_POLICY
-    # How to get a customer id from a leak. Required in practice; the default
-    # uses the leak's own id, which makes caps per-leak rather than per-customer
-    # and is stated here so nobody assumes otherwise.
+    # How to get a customer id from a leak. Defaults to the leak's own
+    # ``customer_ref`` -- carried from the settlement's counterparty by
+    # reconciliation -- so caps are per-customer without any wiring. Falls back
+    # to the leak id only when the source carried no counterparty, which makes
+    # the cap per-leak; that is weaker, and ``is_per_customer`` reports it rather
+    # than letting it pass for the real thing.
     customer_for: Optional[object] = None
 
     def customer_id(self, leak) -> str:
-        return self.customer_for(leak) if self.customer_for is not None else leak.id
+        if self.customer_for is not None:
+            return self.customer_for(leak)
+        return leak.customer_ref if leak.customer_ref else leak.id
+
+    def is_per_customer(self, leak) -> bool:
+        """False when the cap for this leak degrades to per-leak scope."""
+        if self.customer_for is not None:
+            return True
+        return bool(leak.customer_ref)
 
     def __call__(self, leak, at: datetime) -> Ruling:
         return may_contact(self.customer_id(leak), at, consent=self.consent,

@@ -514,3 +514,86 @@ def test_a_rejection_works_without_a_leak_ledger():
     plane.reject("gate:recovery:leak:short:s1", actor="ops@x", at=LATER)
     out = resume(r, plane)
     assert out.written_off == ("leak:short:s1",) and out.is_complete is True
+
+
+# --------------------------------------------------------------------------
+# Post-Sprint-3 — a gate can prove what it was asked about
+# --------------------------------------------------------------------------
+def test_a_gate_carries_no_audit_ref_when_no_log_is_supplied():
+    l = leak()
+    gates = gates_for_run(report(leaks=(l,), recoveries=(halted(l),)), TS)
+    assert gates[0].audit_ref is None
+
+
+def test_a_gate_is_stamped_with_the_event_that_caused_it():
+    """ADR-0023 recorded that `audit_ref` existed and nothing populated it, so a
+    decision was not provable against the root the way a leak is. A gate exists
+    *because of* a logged decision, so it points at that event's leaf."""
+    from reclaim.pipeline import build_audit_log
+
+    l = leak()
+    r = report(leaks=(l,), residual=(l,), recoveries=(halted(l),),
+               ai_outcomes=(escalation(),))
+    audit = build_audit_log(r, TS)
+    gates = gates_for_run(r, TS, audit=audit)
+
+    root, events = audit.root(), audit.events()
+    assert gates
+    for gate in gates:
+        assert gate.audit_ref is not None
+        prefix, raw_index = gate.audit_ref.rsplit(":", 1)
+        assert prefix == root
+        # the ref resolves to a real leaf, and that leaf's proof verifies
+        index = int(raw_index)
+        proof = audit.inclusion_proof(index)
+        assert audit.verify_inclusion(events[index], index, proof, root) is True
+
+
+def test_the_stamped_leaf_is_about_the_gates_own_subject():
+    from reclaim.pipeline import build_audit_log
+
+    l = leak()
+    r = report(leaks=(l,), residual=(l,), recoveries=(halted(l),),
+               ai_outcomes=(escalation(),))
+    audit = build_audit_log(r, TS)
+    events = audit.events()
+    by_id = {g.id: g for g in gates_for_run(r, TS, audit=audit)}
+
+    recovery_gate = by_id["gate:recovery:leak:short:s1"]
+    leaf = events[int(recovery_gate.audit_ref.rsplit(":", 1)[1])]
+    assert leaf.detail.get("leak") == "leak:short:s1"
+
+    match_gate = by_id["gate:match:s3:b3"]
+    leaf = events[int(match_gate.audit_ref.rsplit(":", 1)[1])]
+    assert (leaf.detail.get("settlement"), leaf.detail.get("bank")) == ("s3", "b3")
+
+
+def test_value_gates_are_stamped_too():
+    from reclaim.pipeline import build_audit_log
+
+    big = leak("s1", "50000.00")
+    r = report(leaks=(big,), residual=(big,))
+    audit = build_audit_log(r, TS)
+    gates = gates_for_run(r, TS, value_threshold=inr("15000.00"), audit=audit)
+    assert gates[0].kind is GateKind.VALUE_THRESHOLD
+    assert gates[0].audit_ref is not None
+
+
+def test_open_gates_for_run_passes_the_audit_log_through():
+    from reclaim.pipeline import build_audit_log
+
+    l = leak()
+    r = report(leaks=(l,), recoveries=(halted(l),))
+    plane = open_gates_for_run(r, TS, audit=build_audit_log(r, TS))
+    assert plane.gates()[0].audit_ref is not None
+
+
+def test_a_gate_whose_subject_has_no_event_is_left_unstamped():
+    """Better an absent ref than one pointing at an unrelated leaf."""
+    from reclaim.pipeline import build_audit_log
+
+    l = leak()
+    r = report(leaks=(l,), recoveries=(halted(l),))
+    other = report(leaks=(leak("s9"),), residual=(leak("s9"),))
+    gates = gates_for_run(r, TS, audit=build_audit_log(other, TS))
+    assert gates[0].audit_ref is None

@@ -204,3 +204,51 @@ def test_enum_values():
     assert Direction.DEBIT.value == "debit"
     assert LeakType.FAILED_DEBIT.value == "failed_debit"
     assert RecoveryState.RECOVERED.value == "recovered"
+
+
+# --------------------------------------------------------------------------
+# Post-Sprint-3: the confidence type inconsistency, and customer identity
+# --------------------------------------------------------------------------
+def test_confidence_accepts_decimal_as_well_as_float():
+    """This validator used to reject Decimal while resolver.Assessment rejected
+    float — two modules disagreeing about the type of one concept, which blocked
+    carrying a probabilistic score into a leak without a lossy conversion."""
+    from decimal import Decimal
+
+    assert LeakRecord(id="l1", amount=Money.of("1", "INR"),
+                      leak_type=LeakType.SHORT_PAYMENT,
+                      confidence=Decimal("0.7")).confidence == Decimal("0.7")
+    assert Transaction(id="t1", source=Source.BANK, gross_amount=Money.of("1", "INR"),
+                       ts=datetime(2026, 8, 25, 9, 0),
+                       match_confidence=Decimal("0.9")).match_confidence == Decimal("0.9")
+
+
+def test_a_non_finite_decimal_confidence_is_still_rejected():
+    from decimal import Decimal
+
+    for bad in (Decimal("NaN"), Decimal("Infinity"), Decimal("-1"), Decimal("1.5")):
+        with pytest.raises(DomainError):
+            LeakRecord(id="l1", amount=Money.of("1", "INR"),
+                       leak_type=LeakType.SHORT_PAYMENT, confidence=bad)
+
+
+def test_a_bool_is_still_not_a_confidence():
+    with pytest.raises(DomainError):
+        LeakRecord(id="l1", amount=Money.of("1", "INR"),
+                   leak_type=LeakType.SHORT_PAYMENT, confidence=True)
+
+
+def test_a_leak_can_name_whose_money_it_is():
+    l = LeakRecord(id="l1", amount=Money.of("1", "INR"),
+                   leak_type=LeakType.SHORT_PAYMENT, customer_ref="cust-1")
+    assert l.customer_ref == "cust-1"
+    assert LeakRecord(id="l2", amount=Money.of("1", "INR"),
+                      leak_type=LeakType.SHORT_PAYMENT).customer_ref is None
+
+
+def test_an_empty_customer_ref_is_refused():
+    """Empty-string identity would silently pool every anonymous leak into one
+    'customer' and share a contact allowance between strangers."""
+    with pytest.raises(DomainError):
+        LeakRecord(id="l1", amount=Money.of("1", "INR"),
+                   leak_type=LeakType.SHORT_PAYMENT, customer_ref="")

@@ -259,8 +259,37 @@ def _pair_ref(candidate: ScoredMatch) -> str:
     return f"{candidate.settlement.id}:{candidate.bank.id}"
 
 
+def _audit_index(audit) -> dict:
+    """Map a gate's subject to ``"<root>:<leaf index>"`` in the audit log.
+
+    A gate exists *because of* a logged decision — an escalation, a halt, a
+    residual leak — and those events are already in the Merkle log. Pointing a
+    gate at the event that caused it is therefore possible without inventing new
+    events, and it gives a decision the same provability a leak has: pull the
+    inclusion proof for that leaf and the question's justification is shown to
+    be unaltered.
+
+    Last event wins for a given subject, matching ``build_leak_ledger``: a
+    recovery outcome outranks the detection that preceded it.
+    """
+    index: dict[str, str] = {}
+    if audit is None:
+        return index
+    root = audit.root()
+    for i, event in enumerate(audit.events()):
+        ref = f"{root}:{i}"
+        leak_id = event.detail.get("leak")
+        if leak_id:
+            index[leak_id] = ref
+        settlement, bank = event.detail.get("settlement"), event.detail.get("bank")
+        if settlement and bank:
+            index[f"{settlement}:{bank}"] = ref
+    return index
+
+
 def gates_for_run(report, at: datetime, *,
-                  value_threshold: Optional[Money] = None) -> tuple[Gate, ...]:
+                  value_threshold: Optional[Money] = None,
+                  audit=None) -> tuple[Gate, ...]:
     """Every question this run has to ask a human, derived mechanically.
 
     The point of deriving rather than hand-raising is that a gate cannot be
@@ -270,12 +299,17 @@ def gates_for_run(report, at: datetime, *,
 
     Order is deterministic (AI outcomes, then recoveries, then residual leaks),
     so the queue a human sees is stable across runs.
+
+    When an ``audit`` log is supplied each gate is stamped with an ``audit_ref``
+    of ``"<root>:<leaf index>"`` — the pair needed to pull an inclusion proof —
+    so a human decision can prove what it was asked about.
     """
     if not isinstance(at, datetime):
         raise ControlError("at must be a datetime")
     if value_threshold is not None and not isinstance(value_threshold, Money):
         raise ControlError("value_threshold must be Money or None")
 
+    refs = _audit_index(audit)
     gates: list[Gate] = []
 
     for outcome in report.ai_outcomes:
@@ -290,6 +324,7 @@ def gates_for_run(report, at: datetime, *,
             evidence=(f"probabilistic score {outcome.candidate.score}",
                       f"resolver confidence {outcome.confidence}",
                       f"resolver rationale: {outcome.rationale}"),
+            audit_ref=refs.get(ref),
         ))
 
     for rec in report.recoveries:
@@ -307,6 +342,7 @@ def gates_for_run(report, at: datetime, *,
             question=question, opened_at=at, amount=rec.leak.amount,
             evidence=(f"halted after {len(rec.attempts)} attempt(s)",
                       f"reason: {rec.rationale}"),
+            audit_ref=refs.get(rec.leak.id),
         ))
 
     if value_threshold is not None:
@@ -326,16 +362,18 @@ def gates_for_run(report, at: datetime, *,
                           f"{value_threshold} threshold?"),
                 opened_at=at, amount=leak.amount,
                 evidence=(f"leak type {leak.leak_type.value}", leak.hypothesis),
+                audit_ref=refs.get(leak.id),
             ))
 
     return tuple(gates)
 
 
 def open_gates_for_run(report, at: datetime, *, plane: Optional[ControlPlane] = None,
-                       value_threshold: Optional[Money] = None) -> ControlPlane:
+                       value_threshold: Optional[Money] = None,
+                       audit=None) -> ControlPlane:
     """Derive a run's gates and check them into a control plane."""
     plane = plane if plane is not None else ControlPlane()
-    for gate in gates_for_run(report, at, value_threshold=value_threshold):
+    for gate in gates_for_run(report, at, value_threshold=value_threshold, audit=audit):
         plane.open_gate(gate)
     return plane
 

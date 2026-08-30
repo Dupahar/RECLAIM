@@ -396,3 +396,71 @@ def test_without_a_conduct_rule_nothing_changes():
     out = RecoveryEngine(AlwaysSucceedsExecutor()).recover(
         leak("500.00"), FailureReason.INSUFFICIENT_FUNDS, BASE)
     assert out.final_state is RecoveryState.RECOVERED
+
+
+# --------------------------------------------------------------------------
+# Post-Sprint-3 — the ActionPolicy seam (bandit-chosen channel and message)
+# --------------------------------------------------------------------------
+def _acts():
+    from reclaim.bandit import Action
+    return [Action(Channel.UPI_RETRY, 10, "firm"),
+            Action(Channel.WHATSAPP_NUDGE, 10, "gentle")]
+
+
+def test_a_policy_chooses_the_channel_and_the_attempt_records_the_decision():
+    """Everything an offline evaluator needs has to be written down at decision
+    time: the action key the policy used, its propensity, and the context."""
+    from decimal import Decimal
+    from reclaim.bandit import EpsilonGreedyBandit, EpsilonGreedyConfig
+
+    bandit = EpsilonGreedyBandit(_acts(),
+                                 config=EpsilonGreedyConfig(epsilon=Decimal("0.10")))
+    engine = RecoveryEngine(
+        AlwaysSucceedsExecutor(),
+        action_policy=lambda l, attempt, at: bandit.choose("short-payment", l.id))
+    out = engine.recover(leak("500.00"), FailureReason.INSUFFICIENT_FUNDS, BASE)
+    attempt = out.attempts[0]
+    assert attempt.channel in {Channel.UPI_RETRY, Channel.WHATSAPP_NUDGE}
+    assert attempt.action_key == f"{attempt.channel.value}|10|{attempt.message}"
+    assert attempt.propensity == bandit.propensity(
+        "short-payment", next(a for a in bandit.actions if a.key == attempt.action_key))
+    assert attempt.context_key == "short-payment"
+
+
+def test_the_policy_overrides_the_configured_channel_rotation():
+    from decimal import Decimal
+    from reclaim.bandit import EpsilonGreedyBandit
+
+    only_whatsapp = [a for a in _acts() if a.channel is Channel.WHATSAPP_NUDGE]
+    bandit = EpsilonGreedyBandit(only_whatsapp)
+    engine = RecoveryEngine(
+        AlwaysFailsExecutor(),
+        RecoveryConfig(max_attempts=2, channels=(Channel.UPI_RETRY,)),
+        action_policy=lambda l, attempt, at: bandit.choose("ctx", l.id))
+    out = engine.recover(leak("500.00"), FailureReason.INSUFFICIENT_FUNDS, BASE)
+    assert {a.channel for a in out.attempts} == {Channel.WHATSAPP_NUDGE}
+
+
+def test_a_policy_that_returns_nonsense_halts_rather_than_debiting():
+    class _Broken:
+        action = "whatsapp, probably"
+        propensity = None
+        context_key = "ctx"
+
+    out = RecoveryEngine(AlwaysSucceedsExecutor(),
+                         action_policy=lambda l, attempt, at: _Broken()).recover(
+        leak("500.00"), FailureReason.INSUFFICIENT_FUNDS, BASE)
+    assert out.final_state is RecoveryState.HALTED
+    assert out.attempts == ()
+    assert "no usable channel" in out.rationale
+
+
+def test_without_a_policy_attempts_carry_no_decision_record():
+    """Regression guard, and the reason `logged_decisions` skips such attempts:
+    a row with no propensity cannot be evaluated offline."""
+    out = RecoveryEngine(AlwaysSucceedsExecutor()).recover(
+        leak("500.00"), FailureReason.INSUFFICIENT_FUNDS, BASE)
+    attempt = out.attempts[0]
+    assert attempt.action_key is None and attempt.propensity is None
+    assert attempt.context_key is None and attempt.message is None
+    assert attempt.channel is Channel.UPI_RETRY          # the configured rotation

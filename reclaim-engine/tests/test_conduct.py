@@ -34,9 +34,10 @@ from reclaim.recovery import Channel
 TS = datetime(2026, 8, 25, 10, 0, 0)
 
 
-def leak(lid="leak:1"):
+def leak(lid="leak:1", customer_ref=None):
     return LeakRecord(id=lid, amount=Money.of("500", "INR"),
-                      leak_type=LeakType.SHORT_PAYMENT, recoverable=True)
+                      leak_type=LeakType.SHORT_PAYMENT, recoverable=True,
+                      customer_ref=customer_ref)
 
 
 def granted(customer="cust-1", at=None, **kw):
@@ -348,13 +349,34 @@ def test_the_gate_maps_a_leak_to_a_customer():
     assert gate(leak(), TS).allowed is True
 
 
-def test_without_a_customer_mapping_caps_are_per_leak_not_per_customer():
-    """Stated in the docstring rather than assumed: the default makes the leak id
-    the customer id, which is almost never what a deployment wants."""
+def test_the_leaks_own_customer_ref_is_used_by_default():
+    """Reconciliation carries the settlement's counterparty onto the leak, so
+    caps are per-customer with no wiring at all."""
+    gate = ConductGate(consent=allowing("cust-1"))
+    l = leak(customer_ref="cust-1")
+    assert gate.customer_id(l) == "cust-1"
+    assert gate.is_per_customer(l) is True
+    assert gate(l, TS).allowed is True
+    # a second leak for the same customer shares the allowance
+    assert gate.customer_id(leak("leak:2", customer_ref="cust-1")) == "cust-1"
+
+
+def test_a_leak_with_no_counterparty_degrades_to_a_per_leak_cap_and_says_so():
+    """Weaker scope, reported rather than passing for the real thing."""
     gate = ConductGate(consent=allowing("leak:1"))
     assert gate.customer_id(leak()) == "leak:1"
+    assert gate.is_per_customer(leak()) is False
     assert gate(leak(), TS).allowed is True
     assert gate(leak("leak:2"), TS).allowed is False       # a different "customer"
+
+
+def test_an_explicit_mapping_overrides_the_leaks_own_ref():
+    gate = ConductGate(consent=allowing("override"),
+                       customer_for=lambda l: "override")
+    l = leak(customer_ref="cust-1")
+    assert gate.customer_id(l) == "override"
+    assert gate.is_per_customer(l) is True
+    assert gate.is_per_customer(leak()) is True            # the mapping vouches for it
 
 
 def test_the_gate_authorises_but_does_not_record():

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from decimal import Decimal
 from enum import Enum
 from typing import Optional
 
@@ -75,11 +76,24 @@ def _validate_evidence(evidence) -> None:
              "every evidence item must be a non-empty string")
 
 
-def _validate_confidence(value: Optional[float], label: str) -> None:
+def _validate_confidence(value, label: str) -> None:
+    """Accepts int, float *or* Decimal in [0,1].
+
+    Confidence is a probability, not money, so the no-float rule does not apply
+    (ADR-0002). But this validator used to reject ``Decimal`` while
+    ``resolver.Assessment`` rejected ``float`` — two modules in one codebase
+    disagreeing about the type of the same concept. The consequence was real: a
+    probabilistic score or a resolver confidence, both ``Decimal``, could not be
+    carried into a ``LeakRecord`` without a lossy float conversion first.
+    Widened rather than narrowed, so no existing caller changes.
+
+    Non-finite values fail the range check rather than needing their own guard:
+    ``float(Decimal("NaN"))`` is ``nan``, and ``0.0 <= nan <= 1.0`` is False.
+    """
     if value is None:
         return
     _require(
-        isinstance(value, (int, float)) and not isinstance(value, bool),
+        isinstance(value, (int, float, Decimal)) and not isinstance(value, bool),
         f"{label} must be a number in [0,1]",
     )
     _require(0.0 <= float(value) <= 1.0, f"{label} must be within [0,1], got {value}")
@@ -208,6 +222,11 @@ class LeakRecord:
     recovery_state: RecoveryState = RecoveryState.NONE
     evidence: tuple[str, ...] = ()      # Appendix B: the facts behind the hypothesis
     audit_ref: Optional[str] = None     # Appendix B: link into the Merkle audit log
+    # Whose money this is. Without it, contact caps are per-leak rather than
+    # per-customer, funded-moment history cannot be keyed, and prior-failure
+    # counts cannot be assembled -- three separate capabilities blocked by one
+    # missing field. Optional because not every source carries a counterparty.
+    customer_ref: Optional[str] = None
 
     def __post_init__(self) -> None:
         _require(isinstance(self.id, str) and self.id != "", "leak id is required")
@@ -222,3 +241,6 @@ class LeakRecord:
         _validate_evidence(self.evidence)
         _require(self.audit_ref is None or (isinstance(self.audit_ref, str) and self.audit_ref != ""),
                  "audit_ref must be a non-empty string when set")
+        _require(self.customer_ref is None
+                 or (isinstance(self.customer_ref, str) and self.customer_ref != ""),
+                 "customer_ref must be a non-empty string when set")

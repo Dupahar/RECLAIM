@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from decimal import Decimal
 from enum import Enum
 from typing import Optional, Protocol, runtime_checkable
 
@@ -129,6 +130,36 @@ class RecoveryExecutor(Protocol):
 
 
 @runtime_checkable
+class ActionPolicy(Protocol):
+    """The seam that chooses *how* to contact — channel and message template.
+
+    The engine's own behaviour is to rotate ``config.channels`` deterministically,
+    which learns nothing. A policy may choose per attempt instead;
+    ``bandit.EpsilonGreedyBandit.choose`` returns exactly the shape required.
+
+    **Timing is deliberately not this seam's business.** ``AttemptScheduler``
+    already owns *when*, and it owns the notice-window refusal with it. Two
+    components bidding for the same decision would mean the compliance guard sat
+    in only one of them.
+
+    The consequence is worth stating plainly rather than leaving to be found: a
+    bandit whose actions differ **only** by ``hour`` will learn nothing through
+    this seam, because the engine honours the channel and ignores the hour, so
+    those arms are the same intervention wearing different keys. Vary channel and
+    message here; vary timing through the scheduler.
+
+    The returned object must expose ``action`` (with ``.channel`` and
+    ``.message``), ``propensity`` and ``context_key`` — the propensity because a
+    decision whose probability was not written down at decision time cannot be
+    evaluated offline afterwards (ADR-0027).
+    """
+
+    def __call__(self, leak: LeakRecord, attempt: int,
+                 at: datetime) -> object:  # pragma: no cover - protocol
+        ...
+
+
+@runtime_checkable
 class ConductRule(Protocol):
     """The seam that answers "are we allowed to contact this person right now?".
 
@@ -177,6 +208,15 @@ class RecoveryAttempt:
     at_time: datetime
     idempotency_key: str
     result: AttemptResult
+    # Set only when an ActionPolicy chose the action. Together these are the
+    # decision record an IPS/DR estimator needs. ``action_key`` is the policy's
+    # *own* identifier, stored verbatim: reconstructing one from the channel and
+    # the attempt's hour yields a key matching no action the policy knows about,
+    # and every offline estimate then comes back "not identified".
+    action_key: Optional[str] = None
+    message: Optional[str] = None
+    propensity: Optional[Decimal] = None
+    context_key: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -196,12 +236,14 @@ class RecoveryEngine:
     def __init__(self, executor: RecoveryExecutor, config: RecoveryConfig = DEFAULT_CONFIG,
                  notice_executor: "Optional[NoticeExecutor]" = None,
                  scheduler: "Optional[AttemptScheduler]" = None,
-                 conduct: "Optional[ConductRule]" = None) -> None:
+                 conduct: "Optional[ConductRule]" = None,
+                 action_policy: "Optional[ActionPolicy]" = None) -> None:
         self._executor = executor
         self._config = config
         self._notice_executor = notice_executor
         self._scheduler = scheduler
         self._conduct = conduct
+        self._action_policy = action_policy
 
     def recover(self, leak: LeakRecord, reason: FailureReason, base_time: datetime) -> RecoveryOutcome:
         if not isinstance(base_time, datetime):
@@ -271,6 +313,20 @@ class RecoveryEngine:
         for k in range(cfg.max_attempts):
             at = first_at + timedelta(hours=k * cfg.gap_hours)
             channel = cfg.channels[k % len(cfg.channels)]
+            action_key = message = propensity = context_key = None
+            if self._action_policy is not None:
+                choice = self._action_policy(leak, k, at)
+                chosen = getattr(choice, "action", None)
+                if not isinstance(getattr(chosen, "channel", None), Channel):
+                    return RecoveryOutcome(
+                        leak, RecoveryState.HALTED, tuple(attempts), None,
+                        "action policy returned no usable channel; halted for human",
+                        notice_at, notice_sent)
+                channel = chosen.channel
+                action_key = getattr(chosen, "key", None)
+                message = getattr(chosen, "message", None)
+                propensity = choice.propensity
+                context_key = choice.context_key
             key = f"{leak.id}:attempt:{k}"
             if self._conduct is not None:
                 ruling = self._conduct(leak, at)
@@ -285,7 +341,10 @@ class RecoveryEngine:
                 return RecoveryOutcome(leak, RecoveryState.HALTED, tuple(attempts), None,
                                        "executor error; halted for human", notice_at,
                                        notice_sent)
-            attempts.append(RecoveryAttempt(k, channel, at, key, result))
+            attempts.append(RecoveryAttempt(k, channel, at, key, result,
+                                            action_key=action_key, message=message,
+                                            propensity=propensity,
+                                            context_key=context_key))
             if result is AttemptResult.SUCCEEDED:
                 return RecoveryOutcome(leak, RecoveryState.RECOVERED, tuple(attempts),
                                        leak.amount,
