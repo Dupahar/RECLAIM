@@ -606,3 +606,80 @@ the first time (the experiment wires a `NoticeExecutor`).
   the uplift model and bandit will consume.
 
 ---
+
+## 2026-08-31 — Sprint 3, Phase 25: the HITL control plane (Layer 6)
+
+**What:** `src/reclaim/control.py`, a `GateRepository` in `persistence.py`, and
+`--queue` / `--decide` on the CLI. Layer 6 was the engine's thinnest layer
+(~15%) for a specific reason: `ESCALATE_HUMAN` and `HALTED` were terminal labels
+on a report that then exited the process. There was a human in the name of the
+design and no loop for them to be in.
+
+    open a typed gate  ->  AWAITING_HUMAN  ->  APPROVED / REJECTED / CANCELLED
+         (checkpoint)         (durable)              (resumable)
+
+- **Gates are typed and *derived*, not hand-raised.** `gates_for_run` reads a run
+  and produces every question it owes a human: one per AI escalation, one per
+  halted recovery, and a `VALUE_THRESHOLD` sign-off for chasing a large leak even
+  when nothing went wrong. A halt at the AFA ceiling gets its own kind, because
+  "has the customer authenticated?" and "should we keep going?" are not the same
+  question. Deriving means a gate cannot be forgotten.
+- **A gate is decided exactly once.** Re-deciding raises; replaying the identical
+  decision is a no-op. Two approvals of one high-value debit is the failure mode
+  that costs a merchant money, so the state machine prevents it rather than a UI
+  that hides the button.
+- **Approval authorises; it does not act.** `resume` executes through the same
+  injected engine with the same notice window, AFA ceiling and idempotency keys.
+  A human "yes" on an over-ceiling debit still halts — approval changes who is
+  accountable, not what is safe.
+- **Rehydration cannot invent consent.** A gate log whose first record for an id
+  is already `approved` is refused: a decision with no open checkpoint behind it
+  means the log lost the question.
+- **No anonymous, undated decisions.** `--decide` requires `--actor` and an
+  explicit `--at`. The engine never reads the clock (G4).
+
+ADR-0023.
+
+**Why:** It was both the largest architecture gap and the one that makes the rest
+usable. Every safety mechanism already built — the resolver's escalation, the
+recovery halt, the AFA ceiling — routed to a human who had no queue, so in
+practice all three degraded to "printed and forgotten".
+
+**How tested:** 67 new tests; full suite **530 passed, 100% line + branch**
+(2507 statements, 716 branches, 0 partial) across 25 modules. The load-bearing
+ones try to break a safety claim: `test_a_gate_is_decided_exactly_once`,
+`test_approving_a_gate_moves_no_money`,
+`test_a_human_yes_does_not_bypass_the_afa_ceiling`,
+`test_an_unanswered_gate_makes_the_resume_incomplete`,
+`test_a_log_whose_gate_opens_already_approved_is_refused`, and
+`test_the_checkpointer_survives_a_restart_on_disk` — write a gate in one process,
+load it in another, answer it, reload and find the decision and its history
+intact.
+
+**Result:** ✅ the loop is drivable from the CLI end to end:
+
+```
+python -m reclaim batch.json --store ./run --value-threshold 15000
+  -> human queue: 1 gate/s awaiting -> run/gates.jsonl
+python -m reclaim --queue ./run
+  -> [value_threshold] gate:value:leak:short:s5  20000.00 INR
+     Sign off chasing 20000.00 INR, above the 15000.00 INR threshold?
+     parked behind unanswered questions: 20000.00 INR
+python -m reclaim --queue ./run --decide gate:value:leak:short:s5 \
+    --verdict approve --actor ops@example.com --at 2026-08-26T11:15:00
+  -> approved: gate:value:leak:short:s5 by ops@example.com
+```
+
+**Open items / honest notes:**
+- **Not a workflow engine.** No scheduler, no timer, no retry-on-crash, no SLA on
+  how long a gate may sit. Temporal and a LangGraph checkpointer own those; what
+  is built is the durable state and transition rules they would persist.
+- `resume` does not re-enter the pipeline. An approved match gate is *reported*
+  as confirmed rather than folded back into a fresh `RunReport` with a recomputed
+  match rate; closing that circle means re-running reconciliation with human
+  overrides as an input.
+- `Gate.audit_ref` exists and persists but nothing populates it, so a decision is
+  not yet provable against the Merkle root the way a leak is.
+- Cross-run contact caps and consent state remain unimplemented.
+
+---

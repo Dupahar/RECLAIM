@@ -14,9 +14,17 @@ import sys
 from datetime import datetime
 
 from .batch_io import BatchLoadError, load_batch_file
+from .control import ControlError, GateState, gates_for_run
 from .csv_io import load_batch_csv
 from .ledger import LedgerError
-from .persistence import AuditRepository, JsonlFileStore, LeakRepository, PersistenceError
+from .money import Money, MoneyError
+from .persistence import (
+    AuditRepository,
+    GateRepository,
+    JsonlFileStore,
+    LeakRepository,
+    PersistenceError,
+)
 from .pipeline import persist_run, run_reclaim
 from .reconciliation import ReconciliationError
 from .signing import SigningError, signed_root_record, verify_signed_record
@@ -25,6 +33,10 @@ from .verification import VerificationResult, verify_stores
 
 ROOT_FILE = "root.txt"
 HEADS_FILE = "roots.log"   # append-only history of published (size, root) heads
+GATES_FILE = "gates.jsonl"  # append-only HITL checkpoints (architecture 8)
+
+_VERDICTS = {"approve": GateState.APPROVED, "reject": GateState.REJECTED,
+             "cancel": GateState.CANCELLED}
 
 
 def _print_human(rep) -> None:
@@ -164,6 +176,64 @@ def _do_replay(replay_dir: str, expect_root, key) -> int:
     return 0 if (res.ok and sig_ok) else 1
 
 
+def _gate_repo(d: pathlib.Path) -> GateRepository:
+    return GateRepository(JsonlFileStore(d / GATES_FILE))
+
+
+def _do_queue(queue_dir: str) -> int:
+    """Render the human exception queue for a stored run."""
+    d = pathlib.Path(queue_dir)
+    if not (d / GATES_FILE).exists():
+        print(f"error: no gate log found at {d / GATES_FILE}", file=sys.stderr)
+        return 2
+    plane = _gate_repo(d).load()
+    waiting = plane.awaiting()
+    print(f"human queue: {len(waiting)} awaiting / {plane.size} total  ({d / GATES_FILE})")
+    for gate in waiting:
+        amount = f" {gate.amount}" if gate.amount is not None else ""
+        print(f"  [{gate.kind.value}] {gate.id}{amount}")
+        print(f"      {gate.question}")
+        for line in gate.evidence:
+            print(f"      - {line}")
+    for gate in plane.settled():
+        tail = f" -- {gate.rationale}" if gate.rationale else ""
+        print(f"  ({gate.state.value} by {gate.decided_by}) {gate.id}{tail}")
+    for currency in sorted({g.amount.currency for g in waiting if g.amount is not None}):
+        print(f"  parked behind unanswered questions: {plane.amount_awaiting(currency)}")
+    return 0
+
+
+def _do_decide(queue_dir: str, gate_id: str, verdict: str, actor, at_iso) -> int:
+    """Answer one gate. The decision is appended, never written over."""
+    if actor is None:
+        print("error: --decide requires --actor (a decision with no name on it is not "
+              "an audit trail)", file=sys.stderr)
+        return 2
+    if at_iso is None:
+        print("error: --decide requires --at ISO-8601 (the engine never reads the clock; "
+              "determinism is goal G4)", file=sys.stderr)
+        return 2
+    d = pathlib.Path(queue_dir)
+    if not (d / GATES_FILE).exists():
+        print(f"error: no gate log found at {d / GATES_FILE}", file=sys.stderr)
+        return 2
+    try:
+        at = datetime.fromisoformat(at_iso)
+    except ValueError as exc:
+        print(f"error: invalid --at timestamp: {exc}", file=sys.stderr)
+        return 2
+    plane = _gate_repo(d).load()
+    try:
+        gate = plane.decide(gate_id, _VERDICTS[verdict], actor=actor, at=at)
+    except ControlError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    _gate_repo(d).save_plane(plane)
+    print(f"{gate.state.value}: {gate.id} by {gate.decided_by} at {gate.decided_at.isoformat()}")
+    print(f"  {len(plane.awaiting())} gate/s still awaiting a human")
+    return 0
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="reclaim",
                                      description="Run RECLAIM reconciliation over a JSON batch, "
@@ -181,6 +251,17 @@ def main(argv=None) -> int:
                         help="with --replay: the audit Merkle root to check against (tamper detection)")
     parser.add_argument("--key-file", metavar="PATH",
                         help="HMAC key file: sign the audit root on --store, verify it on --replay")
+    parser.add_argument("--value-threshold", metavar="AMT",
+                        help="with --store: open a HITL sign-off gate for any "
+                             "recoverable leak above AMT")
+    parser.add_argument("--queue", metavar="DIR",
+                        help="show the human exception queue for a stored run under DIR")
+    parser.add_argument("--decide", metavar="GATE_ID",
+                        help="with --queue: answer one gate (needs --verdict, --actor, --at)")
+    parser.add_argument("--verdict", choices=sorted(_VERDICTS), default="approve",
+                        help="with --decide: how to settle the gate (default: approve)")
+    parser.add_argument("--actor", metavar="WHO",
+                        help="with --decide: who is answering (recorded in the audit trail)")
     args = parser.parse_args(argv)
 
     try:
@@ -189,8 +270,26 @@ def main(argv=None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
+    threshold = None
+    if args.value_threshold is not None:
+        try:
+            # round to minor units so the gate question reads as money
+            threshold = Money.of(args.value_threshold, "INR").round()
+        except MoneyError as exc:
+            print(f"error: invalid --value-threshold: {exc}", file=sys.stderr)
+            return 2
+
     if args.replay:
         return _do_replay(args.replay, args.expect_root, key)
+    if args.queue:
+        if args.decide:
+            return _do_decide(args.queue, args.decide, args.verdict,
+                              args.actor, args.at)
+        return _do_queue(args.queue)
+    if args.decide:
+        print("error: --decide needs --queue DIR to say which stored run to act on",
+              file=sys.stderr)
+        return 2
     if not args.batch and not args.csv:
         print("error: provide a batch file, --csv FILE, or --replay DIR to verify a stored run",
               file=sys.stderr)
@@ -242,6 +341,14 @@ def main(argv=None) -> int:
                 fh.write(head_line)
         print(f"published: {store_dir / ROOT_FILE} (anchors --replay), "
               f"head appended to {heads_path.name}")
+        if threshold is not None:
+            plane = _gate_repo(store_dir).load()
+            for gate in gates_for_run(rep, at or datetime(1970, 1, 1),
+                                      value_threshold=threshold):
+                plane.open_gate(gate)
+            _gate_repo(store_dir).save_plane(plane)
+            print(f"human queue: {len(plane.awaiting())} gate/s awaiting "
+                  f"-> {store_dir / GATES_FILE}  (answer with --queue --decide)")
         if key is not None:
             record = signed_root_record(stored_root, key)
             (store_dir / "audit.sig").write_text(json.dumps(record), encoding="utf-8")

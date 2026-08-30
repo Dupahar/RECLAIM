@@ -312,3 +312,126 @@ def test_leak_record_propagates_a_nested_money_error():
     bad["amount"] = {"amount": "not-a-number", "currency": "INR"}
     with pytest.raises(PersistenceError, match="invalid money"):
         leak_from_record(bad, "leak[0]")
+
+
+# --------------------------------------------------------------------------
+# Phase 25 — the HITL checkpointer's storage
+# --------------------------------------------------------------------------
+def _gate(gid="g1", **kw):
+    from reclaim.control import Gate, GateKind
+    base = dict(id=gid, kind=GateKind.RECOVERY_HALT, subject_ref="leak:short:s1",
+                question="Authorise one further attempt?",
+                opened_at=datetime(2026, 8, 31, 9, 0, 0),
+                amount=Money.of("200.00", "INR"), evidence=("halted after 1 attempt",))
+    base.update(kw)
+    return Gate(**base)
+
+
+def test_gate_record_round_trips_including_the_decision():
+    from reclaim.control import ControlPlane, GateState
+    from reclaim.persistence import GateRepository
+
+    plane = ControlPlane()
+    plane.open_gate(_gate())
+    plane.approve("g1", actor="ops@example.com",
+                  at=datetime(2026, 8, 31, 17, 30, 0), rationale="customer confirmed")
+    store = InMemoryStore()
+    GateRepository(store).save_plane(plane)
+
+    reloaded = GateRepository(store).load()
+    assert reloaded.history("g1") == plane.history("g1")
+    assert reloaded.current("g1").state is GateState.APPROVED
+    assert reloaded.current("g1").decided_by == "ops@example.com"
+
+
+def test_a_gate_with_no_amount_round_trips():
+    from reclaim.control import ControlPlane
+    from reclaim.persistence import GateRepository
+
+    plane = ControlPlane()
+    plane.open_gate(_gate(amount=None))
+    store = InMemoryStore()
+    GateRepository(store).save_plane(plane)
+    assert GateRepository(store).load().current("g1").amount is None
+
+
+def test_re_persisting_a_plane_is_a_no_op():
+    from reclaim.control import ControlPlane
+    from reclaim.persistence import GateRepository
+
+    plane = ControlPlane()
+    plane.open_gate(_gate())
+    store = InMemoryStore()
+    GateRepository(store).save_plane(plane)
+    GateRepository(store).save_plane(plane)
+    assert len(store.read()) == 1
+
+
+def test_a_log_whose_gate_opens_already_approved_is_refused():
+    """A decision with no open version behind it means the log lost the
+    checkpoint. Rehydrating it would invent an authorisation nobody gave."""
+    from reclaim.control import GateState
+    from reclaim.persistence import GateRepository, gate_to_record
+
+    orphan = _gate(state=GateState.APPROVED, decided_by="ops@x",
+                   decided_at=datetime(2026, 8, 31, 17, 30, 0))
+    store = InMemoryStore()
+    store.append(gate_to_record(orphan))
+    with pytest.raises(PersistenceError) as exc:
+        GateRepository(store).load()
+    assert "open version is missing" in str(exc.value)
+
+
+def test_a_corrupt_gate_record_is_rejected():
+    from reclaim.persistence import GateRepository
+
+    store = InMemoryStore()
+    store.append({"id": "g1", "kind": "not_a_kind", "subject_ref": "x",
+                  "question": "q", "opened_at": "2026-08-31T09:00:00"})
+    with pytest.raises(PersistenceError):
+        GateRepository(store).load()
+
+
+def test_a_gate_record_missing_its_question_is_rejected():
+    from reclaim.control import ControlError
+    from reclaim.persistence import GateRepository
+
+    store = InMemoryStore()
+    store.append({"id": "g1", "kind": "recovery_halt", "subject_ref": "x",
+                  "question": "", "opened_at": "2026-08-31T09:00:00"})
+    with pytest.raises(ControlError):
+        GateRepository(store).load()
+
+
+def test_a_gate_record_with_bad_money_is_rejected():
+    from reclaim.persistence import GateRepository
+
+    store = InMemoryStore()
+    store.append({"id": "g1", "kind": "recovery_halt", "subject_ref": "x",
+                  "question": "q", "opened_at": "2026-08-31T09:00:00",
+                  "amount": {"amount": "not-a-number", "currency": "INR"}})
+    with pytest.raises(PersistenceError):
+        GateRepository(store).load()
+
+
+def test_the_checkpointer_survives_a_restart_on_disk(tmp_path):
+    """The point of the whole module: a paused decision outlives the process."""
+    from reclaim.control import ControlPlane, GateState
+    from reclaim.persistence import GateRepository, JsonlFileStore
+
+    path = tmp_path / "gates.jsonl"
+    plane = ControlPlane()
+    plane.open_gate(_gate())
+    GateRepository(JsonlFileStore(path)).save_plane(plane)
+
+    # ... a day later, a different process ...
+    resumed = GateRepository(JsonlFileStore(path)).load()
+    assert [g.id for g in resumed.awaiting()] == ["g1"]
+    resumed.approve("g1", actor="ops@example.com",
+                    at=datetime(2026, 9, 1, 10, 0, 0), rationale="checked with the bank")
+    GateRepository(JsonlFileStore(path)).save_plane(resumed)
+
+    final = GateRepository(JsonlFileStore(path)).load()
+    assert final.current("g1").state is GateState.APPROVED
+    assert final.awaiting() == ()
+    assert len(final.history("g1")) == 2

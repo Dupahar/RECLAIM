@@ -21,6 +21,7 @@ from datetime import datetime
 from typing import Protocol, runtime_checkable
 
 from .audit import AuditEvent, MerkleAuditLog
+from .control import ControlError, ControlPlane, Gate, GateKind, GateState
 from .domain import Direction, LeakRecord, LeakType, LedgerEntry, RecoveryState
 from .leak_ledger import LeakLedger
 from .ledger import Ledger, Posting, LedgerError
@@ -156,6 +157,36 @@ def leak_from_record(d, where: str = "leak") -> LeakRecord:
         raise PersistenceError(f"{where}: invalid leak record ({exc})") from exc
 
 
+def gate_to_record(g: Gate) -> dict:
+    return {"id": g.id, "kind": g.kind.value, "subject_ref": g.subject_ref,
+            "question": g.question, "opened_at": g.opened_at.isoformat(),
+            "amount": _money_to(g.amount) if g.amount is not None else None,
+            "evidence": list(g.evidence), "state": g.state.value,
+            "decided_by": g.decided_by,
+            "decided_at": g.decided_at.isoformat() if g.decided_at is not None else None,
+            "rationale": g.rationale, "audit_ref": g.audit_ref}
+
+
+def gate_from_record(d, where: str = "gate") -> Gate:
+    try:
+        amount = d.get("amount")
+        decided_at = d.get("decided_at")
+        return Gate(
+            id=d["id"], kind=GateKind(d["kind"]), subject_ref=d["subject_ref"],
+            question=d["question"], opened_at=datetime.fromisoformat(d["opened_at"]),
+            amount=_money_from(amount, f"{where}.amount") if amount is not None else None,
+            evidence=tuple(d.get("evidence", ())),
+            state=GateState(d.get("state", "awaiting_human")),
+            decided_by=d.get("decided_by"),
+            decided_at=datetime.fromisoformat(decided_at) if decided_at is not None else None,
+            rationale=d.get("rationale", ""), audit_ref=d.get("audit_ref"),
+        )
+    except (PersistenceError, ControlError):
+        raise
+    except Exception as exc:
+        raise PersistenceError(f"{where}: invalid gate ({exc})") from exc
+
+
 def event_to_record(e: AuditEvent) -> dict:
     return {"kind": e.kind, "at": e.at.isoformat(), "detail": dict(e.detail)}
 
@@ -239,6 +270,43 @@ class LeakRepository(_DedupingRepository):
         for i, rec in enumerate(self._store.read()):
             ledger.record(leak_from_record(rec, f"leak[{i}]"))
         return ledger
+
+
+class GateRepository(_DedupingRepository):
+    """Persists HITL gate versions and rehydrates an identical ControlPlane.
+
+    This is the checkpointer's storage. Every version is stored in order, so a
+    reloaded plane answers "who approved this, when, and on what evidence?"
+    exactly as the live one did — the property that makes a paused decision
+    survive a restart rather than merely a process.
+    """
+
+    def save_gate(self, gate: Gate) -> None:
+        self._append_once(gate_to_record(gate))
+
+    def save_plane(self, plane: ControlPlane) -> None:
+        for gate in plane.gates():
+            for version in plane.history(gate.id):
+                self.save_gate(version)
+
+    def load(self) -> ControlPlane:
+        plane = ControlPlane()
+        # Versions arrive in append order. The first record for an id opens the
+        # gate; later ones are its decisions, replayed through the same
+        # transition rules the live plane enforces, so a corrupt or reordered
+        # log cannot rehydrate into a state the state machine forbids.
+        for i, rec in enumerate(self._store.read()):
+            gate = gate_from_record(rec, f"gate[{i}]")
+            if plane.current(gate.id) is None:
+                if gate.is_settled:
+                    raise PersistenceError(
+                        f"gate[{i}]: {gate.id!r} first appears already "
+                        f"{gate.state.value}; its open version is missing")
+                plane.open_gate(gate)
+                continue
+            plane.decide(gate.id, gate.state, actor=gate.decided_by,
+                         at=gate.decided_at, rationale=gate.rationale)
+        return plane
 
 
 class AuditRepository(_DedupingRepository):

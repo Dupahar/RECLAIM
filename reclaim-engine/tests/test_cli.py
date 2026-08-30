@@ -482,3 +482,154 @@ def test_replay_without_a_head_history_reports_no_append_only_check(tmp_path, ca
     out = capsys.readouterr().out
     assert rc == 0
     assert "append-only" not in out          # silent, not a bogus "ok"
+
+
+# --------------------------------------------------------------------------
+# Phase 25 — the human exception queue, driven from the CLI
+# --------------------------------------------------------------------------
+def _big_leak_batch(tmp_path):
+    """A batch with one short payment large enough to need sign-off."""
+    data = {
+        "settlements": [{"id": "s5", "gross_amount": "50000.00", "currency": "INR",
+                         "ts": "2026-08-25T09:00:00", "refs": {"utr": "UTR-5"}}],
+        "bank_credits": [{"id": "b5", "gross_amount": "30000.00", "currency": "INR",
+                          "ts": "2026-08-25T09:00:00", "refs": {"utr": "UTR-5"}}],
+    }
+    path = tmp_path / "big.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    return path
+
+
+def test_value_threshold_opens_a_signoff_gate(tmp_path, capsys):
+    batch = _big_leak_batch(tmp_path)
+    run = tmp_path / "run"
+    rc = main([str(batch), "--store", str(run), "--value-threshold", "15000"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "1 gate/s awaiting" in out
+    assert (run / "gates.jsonl").exists()
+
+
+def test_no_threshold_opens_no_gates(tmp_path, capsys):
+    batch = _big_leak_batch(tmp_path)
+    run = tmp_path / "run"
+    main([str(batch), "--store", str(run)])
+    assert not (run / "gates.jsonl").exists()
+
+
+def test_invalid_value_threshold_is_refused(capsys):
+    rc = main([str(SAMPLE), "--value-threshold", "not-money"])
+    assert rc == 2
+    assert "invalid --value-threshold" in capsys.readouterr().err
+
+
+def test_queue_renders_the_awaiting_gates(tmp_path, capsys):
+    batch = _big_leak_batch(tmp_path)
+    run = tmp_path / "run"
+    main([str(batch), "--store", str(run), "--value-threshold", "15000"])
+    capsys.readouterr()
+
+    rc = main(["--queue", str(run)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "1 awaiting / 1 total" in out
+    assert "gate:value:leak:short:s5" in out
+    assert "Sign off chasing 20000.00 INR" in out
+    assert "parked behind unanswered questions: 20000.00 INR" in out
+
+
+def test_queue_without_a_gate_log_is_an_error(tmp_path, capsys):
+    rc = main(["--queue", str(tmp_path / "nothing")])
+    assert rc == 2
+    assert "no gate log found" in capsys.readouterr().err
+
+
+def test_the_full_pause_persist_answer_loop(tmp_path, capsys):
+    """The capability Phase 25 exists for: a decision outlives the process."""
+    batch = _big_leak_batch(tmp_path)
+    run = tmp_path / "run"
+    main([str(batch), "--store", str(run), "--value-threshold", "15000"])
+    capsys.readouterr()
+
+    rc = main(["--queue", str(run), "--decide", "gate:value:leak:short:s5",
+               "--verdict", "approve", "--actor", "ops@example.com",
+               "--at", "2026-08-26T11:15:00"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "approved: gate:value:leak:short:s5 by ops@example.com" in out
+    assert "0 gate/s still awaiting" in out
+
+    # a fresh invocation -- a different process -- sees the decision
+    main(["--queue", str(run)])
+    out = capsys.readouterr().out
+    assert "0 awaiting / 1 total" in out
+    assert "(approved by ops@example.com)" in out
+
+
+def test_a_gate_cannot_be_decided_twice_from_the_cli(tmp_path, capsys):
+    batch = _big_leak_batch(tmp_path)
+    run = tmp_path / "run"
+    main([str(batch), "--store", str(run), "--value-threshold", "15000"])
+    main(["--queue", str(run), "--decide", "gate:value:leak:short:s5",
+          "--actor", "ops@example.com", "--at", "2026-08-26T11:15:00"])
+    capsys.readouterr()
+
+    rc = main(["--queue", str(run), "--decide", "gate:value:leak:short:s5",
+               "--verdict", "reject", "--actor", "someone.else@example.com",
+               "--at", "2026-08-26T12:00:00"])
+    assert rc == 2
+    assert "decided once" in capsys.readouterr().err
+
+
+def test_rejecting_and_cancelling_are_both_available(tmp_path, capsys):
+    batch = _big_leak_batch(tmp_path)
+    run = tmp_path / "run"
+    main([str(batch), "--store", str(run), "--value-threshold", "15000"])
+    rc = main(["--queue", str(run), "--decide", "gate:value:leak:short:s5",
+               "--verdict", "cancel", "--actor", "system", "--at", "2026-08-26T11:15:00"])
+    assert rc == 0
+    assert "cancelled:" in capsys.readouterr().out
+
+
+def test_a_decision_must_be_signed_and_timestamped(tmp_path, capsys):
+    """No anonymous approvals, and no clock reads (G4)."""
+    batch = _big_leak_batch(tmp_path)
+    run = tmp_path / "run"
+    main([str(batch), "--store", str(run), "--value-threshold", "15000"])
+    capsys.readouterr()
+
+    rc = main(["--queue", str(run), "--decide", "gate:value:leak:short:s5",
+               "--at", "2026-08-26T11:15:00"])
+    assert rc == 2 and "requires --actor" in capsys.readouterr().err
+
+    rc = main(["--queue", str(run), "--decide", "gate:value:leak:short:s5",
+               "--actor", "ops@example.com"])
+    assert rc == 2 and "requires --at" in capsys.readouterr().err
+
+    rc = main(["--queue", str(run), "--decide", "gate:value:leak:short:s5",
+               "--actor", "ops@example.com", "--at", "not-a-date"])
+    assert rc == 2 and "invalid --at" in capsys.readouterr().err
+
+
+def test_deciding_an_unknown_gate_is_an_error(tmp_path, capsys):
+    batch = _big_leak_batch(tmp_path)
+    run = tmp_path / "run"
+    main([str(batch), "--store", str(run), "--value-threshold", "15000"])
+    capsys.readouterr()
+    rc = main(["--queue", str(run), "--decide", "gate:value:nope",
+               "--actor", "ops@example.com", "--at", "2026-08-26T11:15:00"])
+    assert rc == 2 and "unknown gate id" in capsys.readouterr().err
+
+
+def test_decide_without_a_queue_directory_is_refused(capsys):
+    rc = main(["--decide", "gate:value:x", "--actor", "ops@example.com",
+               "--at", "2026-08-26T11:15:00"])
+    assert rc == 2
+    assert "needs --queue DIR" in capsys.readouterr().err
+
+
+def test_decide_against_a_missing_gate_log_is_an_error(tmp_path, capsys):
+    rc = main(["--queue", str(tmp_path / "ghost"), "--decide", "g1",
+               "--actor", "ops@example.com", "--at", "2026-08-26T11:15:00"])
+    assert rc == 2
+    assert "no gate log found" in capsys.readouterr().err
